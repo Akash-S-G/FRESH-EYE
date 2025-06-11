@@ -33,7 +33,10 @@ app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
 # Initialize serial reader as a global singleton
-serial_reader = SerialReader()
+serial_reader = None
+
+def get_serial_reader():
+    return SerialReader()
 
 UPLOAD_FOLDER = 'uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -80,6 +83,9 @@ def load_ml_assets():
 
 with app.app_context():
     load_ml_assets()
+
+# Initialize serial reader when app starts
+get_serial_reader()
 
 def predict_image_from_bytes(image_bytes):
     if model is None:
@@ -305,11 +311,11 @@ def extract_nutrition_api():
 
 @app.route('/get_iot_data')
 def get_iot_data():
-    print("\n=== GET /get_iot_data ===")
     try:
-        data = serial_reader.get_latest_data()
-        print(f"Raw data from serial reader: {data}")
-        
+        reader = get_serial_reader()
+        print("SerialReader instance id (in route):", id(reader))
+        data = reader.get_latest_data()
+        print("Data returned to frontend:", data)
         # Ensure all values are properly formatted
         response_data = {
             'temperature': float(data.get('temperature', 0)),
@@ -317,15 +323,12 @@ def get_iot_data():
             'lastUpdate': str(data.get('lastUpdate', 'Never')),
             'connected': bool(data.get('connected', False))
         }
-        
-        print(f"Formatted response data: {response_data}")
         return jsonify(response_data)
     except Exception as e:
-        print(f"Error in get_iot_data: {str(e)}")
         return jsonify({
             'temperature': 0.0,
             'humidity': 0.0,
-            'lastUpdate': f'Error: {str(e)}',
+            'lastUpdate': 'Never',
             'connected': False
         })
 
@@ -337,7 +340,8 @@ def set_port():
         if not new_port:
             return jsonify({'error': 'No port specified'}), 400
             
-        SerialReader.set_port(new_port)
+        reader = get_serial_reader()
+        reader.set_port(new_port)
         return jsonify({
             'message': 'Port updated successfully',
             'current_config': ARDUINO_CONFIG
@@ -416,10 +420,5 @@ def send_email():
         print(f"Error sending email: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-# Add cleanup on app shutdown
-@app.teardown_appcontext
-def cleanup(exception=None):
-    serial_reader.stop()
-
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True) 
+    app.run(host='0.0.0.0', port=5000, debug=False) 
