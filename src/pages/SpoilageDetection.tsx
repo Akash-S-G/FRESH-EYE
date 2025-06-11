@@ -60,8 +60,8 @@ interface SpoilageResult {
 }
 
 interface IoTSensorData {
-  temperature: number;
-  humidity: number;
+  temperature: number | null;
+  humidity: number | null;
   lastUpdate: string;
   connected: boolean;
 }
@@ -92,10 +92,10 @@ const mockSpoilageResult: SpoilageResult = {
 };
 
 const mockIoTData: IoTSensorData = {
-  temperature: 4.2,
-  humidity: 65,
-  lastUpdate: "2 minutes ago",
-  connected: true,
+  temperature: null,
+  humidity: null,
+  lastUpdate: "Never",
+  connected: false,
 };
 
 const CAMERA_OPTIONS = [
@@ -124,18 +124,60 @@ export default function SpoilageDetection() {
   const webcamRef = useRef<Webcam>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Simulate live IoT data updates
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setIoTData((prev) => ({
-        ...prev,
-        temperature: 4.0 + Math.random() * 1.0,
-        humidity: 60 + Math.random() * 10,
-        lastUpdate: "Just now",
-      }));
-    }, 5000);
+  const fetchIoTData = async () => {
+    console.log('\n=== Fetching IoT Data ===');
+    try {
+      const response = await fetch('http://localhost:5000/get_iot_data');
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data = await response.json();
+      console.log('Raw response data:', data);
+      
+      // Validate data
+      if (typeof data.temperature !== 'number' || 
+          typeof data.humidity !== 'number' || 
+          typeof data.connected !== 'boolean' || 
+          typeof data.lastUpdate !== 'string') {
+        console.error('Invalid data format received:', data);
+        return;
+      }
 
-    return () => clearInterval(interval);
+      setIoTData({
+        temperature: data.temperature,
+        humidity: data.humidity,
+        connected: data.connected,
+        lastUpdate: data.lastUpdate
+      });
+      console.log('Updated IoT state:', {
+        temperature: data.temperature,
+        humidity: data.humidity,
+        connected: data.connected,
+        lastUpdate: data.lastUpdate
+      });
+    } catch (error) {
+      console.error('Error fetching IoT data:', error);
+      setIoTData({
+        temperature: 0,
+        humidity: 0,
+        connected: false,
+        lastUpdate: 'Error: ' + (error instanceof Error ? error.message : 'Unknown error')
+      });
+    }
+  };
+
+  useEffect(() => {
+    console.log('Setting up IoT data polling...');
+    // Fetch immediately
+    fetchIoTData();
+    
+    // Then fetch every 2 seconds
+    const interval = setInterval(fetchIoTData, 2000);
+    
+    return () => {
+      console.log('Cleaning up IoT data polling...');
+      clearInterval(interval);
+    };
   }, []);
 
   useEffect(() => {
@@ -210,17 +252,22 @@ export default function SpoilageDetection() {
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
+      console.log('File selected:', file.name, 'Size:', file.size);
       const reader = new FileReader();
       reader.onload = (e) => {
         const imageSrc = e.target?.result as string;
+        console.log('Image loaded, size:', imageSrc.length);
         handleImageAnalysis(imageSrc);
+      };
+      reader.onerror = (error) => {
+        console.error('Error reading file:', error);
+        setCameraError('Failed to read the image file');
       };
       reader.readAsDataURL(file);
     }
   };
 
   const handleImageAnalysis = async (imageSrc: string) => {
-    // Defensive check to ensure button isn't stuck
     if (isScanning) {
       console.log('handleImageAnalysis: Already scanning, resetting.');
       setIsScanning(false);
@@ -228,14 +275,14 @@ export default function SpoilageDetection() {
 
     try {
       setIsScanning(true);
-      console.log('handleImageAnalysis: Starting image analysis for:', imageSrc);
+      setCameraError(null);
+      console.log('handleImageAnalysis: Starting image analysis');
 
       // Convert base64 to blob
-      console.log('handleImageAnalysis: Fetching image to convert to blob...');
+      console.log('handleImageAnalysis: Converting image to blob...');
       const base64Response = await fetch(imageSrc);
       if (!base64Response.ok) {
-        const errorDetails = await base64Response.text();
-        throw new Error(`Failed to fetch image for blob conversion (status: ${base64Response.status}): ${errorDetails}`);
+        throw new Error(`Failed to process image: ${base64Response.statusText}`);
       }
       const blob = await base64Response.blob();
       console.log('handleImageAnalysis: Image converted to blob, size:', blob.size);
@@ -243,51 +290,44 @@ export default function SpoilageDetection() {
       // Create form data
       const formData = new FormData();
       formData.append('image', blob, 'capture.jpg');
-      console.log('handleImageAnalysis: FormData created.');
+      console.log('handleImageAnalysis: Sending request to backend...');
 
-      // Send to backend with timeout
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => {
-        controller.abort();
-        console.warn('handleImageAnalysis: Backend request timed out.');
-      }, 10000); // 10 second timeout
-      console.log('handleImageAnalysis: Sending image to backend...');
-
-      const result = await fetch('http://localhost:5000/predict_from_esp32', {
+      const response = await fetch('http://localhost:5000/predict_from_esp32', {
         method: 'POST',
         body: formData,
-        signal: controller.signal
       });
 
-      clearTimeout(timeoutId);
-      console.log('handleImageAnalysis: Received response from backend, status:', result.status);
-
-      if (!result.ok) {
-        const errorText = await result.text();
-        throw new Error(`Failed to get prediction from server: ${result.status} ${result.statusText} - ${errorText}`);
+      console.log('handleImageAnalysis: Received response, status:', response.status);
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Server error: ${response.status} ${response.statusText} - ${errorText}`);
       }
 
-      const data = await result.json();
-      console.log('handleImageAnalysis: Backend response data:', data);
+      const data = await response.json();
+      console.log('handleImageAnalysis: Full response data:', JSON.stringify(data, null, 2));
 
       if (data.status === 'success') {
-        setScanResult({
+        // Create a more detailed result object
+        const result = {
           ...mockSpoilageResult,
-          predictedClass: data.predictedClass,
-          confidence: data.confidence,
-          status: data.spoilage_status?.toLowerCase() || 'good',
-          foodItemName: data.foodItemName,
-        });
-        console.log('handleImageAnalysis: Scan result updated.');
+          predictedClass: data.predictedClass || 'Unknown',
+          confidence: data.confidence || 0,
+          status: (data.spoilage_status || 'good').toLowerCase(),
+          foodItemName: data.foodItemName || 'Unknown Food Item'
+        };
+        
+        console.log('handleImageAnalysis: Processed result:', JSON.stringify(result, null, 2));
+        setScanResult(result);
       } else {
         throw new Error(data.message || 'Failed to analyze image');
       }
     } catch (error) {
       console.error('handleImageAnalysis Error:', error);
       setCameraError(error instanceof Error ? error.message : 'Failed to analyze image');
+      setScanResult(null);
     } finally {
       setIsScanning(false);
-      console.log('handleImageAnalysis: Scanning finished.');
     }
   };
 
@@ -412,6 +452,9 @@ export default function SpoilageDetection() {
               </>
             )}
           </Badge>
+          <span className="text-sm text-gray-500">
+            Last Update: {iotData.lastUpdate}
+          </span>
         </div>
       </div>
 
@@ -567,6 +610,68 @@ export default function SpoilageDetection() {
               </div>
             </CardContent>
           </Card>
+
+          {/* Prediction Results Card */}
+          {scanResult && (
+            <Card className="bg-white/80 backdrop-blur-sm">
+              <CardHeader>
+                <CardTitle className="flex items-center">
+                  <Target className="h-5 w-5 mr-2 text-emerald-600" />
+                  Analysis Results
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-4">
+                  <div className="text-center">
+                    <div className="text-lg font-bold text-emerald-700">
+                      {scanResult.foodItemName || 'Unknown Food Item'}
+                    </div>
+                    <div className="text-sm text-gray-600">
+                      Prediction: {scanResult.predictedClass || 'Unknown'}
+                    </div>
+                    <div className="text-sm text-gray-600">
+                      Confidence: {scanResult.confidence ? `${scanResult.confidence.toFixed(1)}%` : '0%'}
+                    </div>
+                    <div className="text-sm text-gray-600">
+                      Status: {scanResult.status ? scanResult.status.charAt(0).toUpperCase() + scanResult.status.slice(1) : 'Unknown'}
+                    </div>
+                  </div>
+
+                  {scanResult.indicators && scanResult.indicators.length > 0 && (
+                    <div className="mt-4">
+                      <h4 className="font-medium text-gray-900 mb-2">Indicators</h4>
+                      <div className="space-y-2">
+                        {scanResult.indicators.map((indicator, index) => (
+                          <div key={index} className="flex items-start space-x-2">
+                            <div className={`w-2 h-2 rounded-full mt-2 ${
+                              indicator.severity === 'low' ? 'bg-green-500' :
+                              indicator.severity === 'medium' ? 'bg-yellow-500' :
+                              'bg-red-500'
+                            }`} />
+                            <div>
+                              <div className="text-sm font-medium">{indicator.type}</div>
+                              <div className="text-sm text-gray-600">{indicator.description}</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {scanResult.recommendations && scanResult.recommendations.length > 0 && (
+                    <div className="mt-4">
+                      <h4 className="font-medium text-gray-900 mb-2">Recommendations</h4>
+                      <ul className="list-disc list-inside space-y-1">
+                        {scanResult.recommendations.map((rec, index) => (
+                          <li key={index} className="text-sm text-gray-600">{rec}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          )}
         </TabsContent>
 
         <TabsContent value="iot" className="space-y-6">
@@ -586,14 +691,14 @@ export default function SpoilageDetection() {
                   <div className="text-center p-4 bg-blue-50 rounded-lg">
                     <Thermometer className="h-8 w-8 text-blue-500 mx-auto mb-2" />
                     <div className="text-2xl font-bold text-blue-700">
-                      {iotData.temperature.toFixed(1)}°C
+                      {iotData.temperature !== null ? `${iotData.temperature.toFixed(1)}°C` : '--°C'}
                     </div>
                     <div className="text-sm text-blue-600">Temperature</div>
                   </div>
                   <div className="text-center p-4 bg-teal-50 rounded-lg">
                     <Droplets className="h-8 w-8 text-teal-500 mx-auto mb-2" />
                     <div className="text-2xl font-bold text-teal-700">
-                      {iotData.humidity.toFixed(0)}%
+                      {iotData.humidity !== null ? `${iotData.humidity.toFixed(0)}%` : '--%'}
                     </div>
                     <div className="text-sm text-teal-600">Humidity</div>
                   </div>

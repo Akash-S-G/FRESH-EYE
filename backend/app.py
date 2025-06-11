@@ -10,6 +10,10 @@ from nutrition_extraction import extract_nutrition
 from dotenv import load_dotenv
 import requests
 from flask_cors import CORS
+from serial_reader import SerialReader, ARDUINO_CONFIG
+import base64
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
 
 # Load environment variables from .env
 load_dotenv()
@@ -17,7 +21,10 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + GEMINI_API_KEY if GEMINI_API_KEY else None
 
 app = Flask(__name__)
-CORS(app, resources={r"/*":{"origins":["http://localhost:5173"]}})
+CORS(app)  # Enable CORS for all routes
+
+# Initialize serial reader as a global singleton
+serial_reader = SerialReader()
 
 UPLOAD_FOLDER = 'uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -88,7 +95,6 @@ def predict_with_gemini(image_bytes):
     if not GEMINI_API_KEY or not GEMINI_API_URL:
         return None
     try:
-        import base64
         img_b64 = base64.b64encode(image_bytes).decode('utf-8')
         payload = {
             "contents": [
@@ -209,6 +215,53 @@ def extract_nutrition_api():
     text = data['text']
     nutrition = extract_nutrition(text)
     return jsonify({'status': 'success', 'nutrition': nutrition})
+
+@app.route('/get_iot_data')
+def get_iot_data():
+    print("\n=== GET /get_iot_data ===")
+    try:
+        data = serial_reader.get_latest_data()
+        print(f"Raw data from serial reader: {data}")
+        
+        # Ensure all values are properly formatted
+        response_data = {
+            'temperature': float(data.get('temperature', 0)),
+            'humidity': float(data.get('humidity', 0)),
+            'lastUpdate': str(data.get('lastUpdate', 'Never')),
+            'connected': bool(data.get('connected', False))
+        }
+        
+        print(f"Formatted response data: {response_data}")
+        return jsonify(response_data)
+    except Exception as e:
+        print(f"Error in get_iot_data: {str(e)}")
+        return jsonify({
+            'temperature': 0.0,
+            'humidity': 0.0,
+            'lastUpdate': f'Error: {str(e)}',
+            'connected': False
+        })
+
+@app.route('/set_port', methods=['POST'])
+def set_port():
+    try:
+        data = request.get_json()
+        new_port = data.get('port')
+        if not new_port:
+            return jsonify({'error': 'No port specified'}), 400
+            
+        SerialReader.set_port(new_port)
+        return jsonify({
+            'message': 'Port updated successfully',
+            'current_config': ARDUINO_CONFIG
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Add cleanup on app shutdown
+@app.teardown_appcontext
+def cleanup(exception=None):
+    serial_reader.stop()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True) 
