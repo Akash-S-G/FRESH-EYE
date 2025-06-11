@@ -94,7 +94,7 @@ def predict_with_gemini(image_bytes):
             "contents": [
                 {
                     "parts": [
-                        {"text": "Classify the food item in this image as fresh or spoiled.and predict the food item Respond with a JSON object: {predictedClass: <class>, confidence: <confidence as a float between 0 and 1> ,food_item: <food item name>}"},
+                        {"text": "Classify the food item in this image as fresh or spoiled. Also, identify the specific food item. Respond with a JSON object: {foodItemName: <name of food item>, predictedClass: <fresh/spoiled>, confidence: <confidence as a float between 0 and 1>}"},
                         {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}}
                     ]
                 }
@@ -139,6 +139,7 @@ def predict_from_esp32():
         if gemini_result and 'predictedClass' in gemini_result and 'confidence' in gemini_result:
             response_data = {
                 "status": "success",
+                "foodItemName": gemini_result.get('foodItemName', 'Unknown'),
                 "predictedClass": gemini_result['predictedClass'],
                 "confidence": float(gemini_result['confidence']) * 100,
                 "source": "gemini"
@@ -178,6 +179,7 @@ def get_latest_prediction_result():
         if gemini_result and 'predictedClass' in gemini_result and 'confidence' in gemini_result:
             response_data = {
                 "status": "success",
+                "foodItemName": gemini_result.get('foodItemName', 'Unknown'),
                 "predictedClass": gemini_result['predictedClass'],
                 "confidence": float(gemini_result['confidence']) * 100,
                 "source": "gemini"

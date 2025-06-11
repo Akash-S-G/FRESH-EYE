@@ -56,6 +56,7 @@ interface SpoilageResult {
   estimatedShelfLife: string;
   detectedIssues: string[];
   predictedClass?: string;
+  foodItemName?: string;
 }
 
 interface IoTSensorData {
@@ -274,7 +275,8 @@ export default function SpoilageDetection() {
           ...mockSpoilageResult,
           predictedClass: data.predictedClass,
           confidence: data.confidence,
-          status: data.spoilage_status?.toLowerCase() || 'good'
+          status: data.spoilage_status?.toLowerCase() || 'good',
+          foodItemName: data.foodItemName,
         });
         console.log('handleImageAnalysis: Scan result updated.');
       } else {
@@ -484,7 +486,10 @@ export default function SpoilageDetection() {
                 {scanResult ? (
                   <div className="text-center mb-4">
                     <div className="text-lg text-emerald-700 font-bold">
-                      {scanResult.predictedClass || 'N/A'}
+                      {scanResult.foodItemName || 'N/A'}
+                    </div>
+                    <div className="text-sm text-gray-600">
+                      Prediction: {scanResult.predictedClass || 'N/A'}
                     </div>
                     <div className="text-sm text-gray-600">
                       Confidence: {scanResult.confidence ? `${scanResult.confidence.toFixed(1)}%` : '0%'}
