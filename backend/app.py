@@ -14,11 +14,20 @@ from serial_reader import SerialReader, ARDUINO_CONFIG
 import base64
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 
 # Load environment variables from .env
 load_dotenv()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + GEMINI_API_KEY if GEMINI_API_KEY else None
+SMTP_SERVER = os.getenv('SMTP_SERVER')
+SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
+SMTP_USERNAME = os.getenv('SMTP_USERNAME')
+SMTP_PASSWORD = os.getenv('SMTP_PASSWORD')
+SENDER_EMAIL = os.getenv('SENDER_EMAIL')
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -211,7 +220,7 @@ def analyze_nutrition_with_gemini(text):
     if not GEMINI_API_KEY or not GEMINI_API_URL:
         return None
     try:
-        prompt = """Analyze this nutrition label text and extract the following information in JSON format:
+        prompt = """Analyze this nutrition label text and extract ALL nutrition values present in the label. Return the data in this JSON format:
         {
             "calories": number,
             "protein": number,
@@ -224,13 +233,24 @@ def analyze_nutrition_with_gemini(text):
             "ingredients": string[],
             "health_score": number (0-10),
             "benefits": string[],
-            "warnings": string[]
+            "warnings": string[],
+            "additional_nutrients": {
+                "nutrient_name": {
+                    "value": number,
+                    "unit": string,
+                    "daily_value": number (if available)
+                }
+            }
         }
-        Calculate health_score based on:
-        - High protein and fiber are good
-        - High sugar, sodium, and fat are bad
-        - Consider serving size in calculations
-        List benefits and warnings based on the nutritional values.
+        Rules:
+        1. Extract ALL nutrition values present in the label, not just the main ones
+        2. Include any vitamins, minerals, or other nutrients listed
+        3. For each nutrient, include its value, unit, and daily value percentage if available
+        4. Calculate health_score based on:
+           - High protein and fiber are good
+           - High sugar, sodium, and fat are bad
+           - Consider serving size in calculations
+        5. List benefits and warnings based on the nutritional values
         Text to analyze: """
         
         payload = {
@@ -324,6 +344,77 @@ def set_port():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/send_email', methods=['POST'])
+def send_email():
+    try:
+        data = request.get_json()
+        if not data or 'email' not in data or 'nutritionData' not in data:
+            return jsonify({'status': 'error', 'message': 'Missing required data'}), 400
+
+        recipient_email = data['email']
+        nutrition_data = data['nutritionData']
+
+        # Create email message
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = recipient_email
+        msg['Subject'] = 'Your Nutrition Analysis Results'
+
+        # Create HTML content
+        html_content = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <h2 style="color: #2e7d32;">Nutrition Analysis Results</h2>
+            
+            <div style="background-color: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                <h3 style="color: #1b5e20;">Health Score: {nutrition_data.get('health_score', 'N/A')}/10</h3>
+                
+                <h4>Main Nutrients:</h4>
+                <ul>
+                    <li>Calories: {nutrition_data.get('calories', 'N/A')}</li>
+                    <li>Protein: {nutrition_data.get('protein', 'N/A')}g</li>
+                    <li>Carbohydrates: {nutrition_data.get('carbs', 'N/A')}g</li>
+                    <li>Fat: {nutrition_data.get('fat', 'N/A')}g</li>
+                    <li>Fiber: {nutrition_data.get('fiber', 'N/A')}g</li>
+                    <li>Sugar: {nutrition_data.get('sugar', 'N/A')}g</li>
+                    <li>Sodium: {nutrition_data.get('sodium', 'N/A')}mg</li>
+                </ul>
+
+                <h4>Serving Size:</h4>
+                <p>{nutrition_data.get('serving_size', 'N/A')}</p>
+
+                <h4>Health Benefits:</h4>
+                <ul>
+                    {''.join(f'<li>{benefit}</li>' for benefit in nutrition_data.get('benefits', []))}
+                </ul>
+
+                <h4>Warnings:</h4>
+                <ul>
+                    {''.join(f'<li>{warning}</li>' for warning in nutrition_data.get('warnings', []))}
+                </ul>
+            </div>
+
+            <p style="color: #666; font-size: 0.9em;">
+                This analysis was performed using Fresh Eye's advanced nutrition analysis system.
+            </p>
+        </body>
+        </html>
+        """
+
+        msg.attach(MIMEText(html_content, 'html'))
+
+        # Connect to SMTP server and send email
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+
+        return jsonify({'status': 'success', 'message': 'Email sent successfully'})
+
+    except Exception as e:
+        print(f"Error sending email: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 # Add cleanup on app shutdown
 @app.teardown_appcontext

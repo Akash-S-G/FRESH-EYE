@@ -25,6 +25,7 @@ import {
   Heart,
   Shield,
   TrendingUp,
+  Loader2,
 } from "lucide-react";
 import {
   Card,
@@ -120,6 +121,7 @@ export default function SpoilageDetection() {
   const [laptopDeviceId, setLaptopDeviceId] = useState<string | undefined>(undefined);
   const [esp32ImageUrl, setEsp32ImageUrl] = useState<string>("");
   const [esp32ImageLoading, setEsp32ImageLoading] = useState<boolean>(false);
+  const [isUploading, setIsUploading] = useState(false);
 
   const webcamRef = useRef<Webcam>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -252,63 +254,104 @@ export default function SpoilageDetection() {
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
+      setIsUploading(true);
       console.log('File selected:', file.name, 'Size:', file.size);
       const reader = new FileReader();
       reader.onload = (e) => {
         const imageSrc = e.target?.result as string;
         console.log('Image loaded, size:', imageSrc.length);
-        handleImageAnalysis(imageSrc);
+        handleImageAnalysis(imageSrc).finally(() => {
+          setIsUploading(false);
+        });
       };
       reader.onerror = (error) => {
         console.error('Error reading file:', error);
         setCameraError('Failed to read the image file');
+        setIsUploading(false);
       };
       reader.readAsDataURL(file);
     }
   };
 
-  const handleImageAnalysis = async (imageSrc: string) => {
+  const handleCameraCapture = async () => {
     if (isScanning) {
-      console.log('handleImageAnalysis: Already scanning, resetting.');
-      setIsScanning(false);
+      console.log('Already scanning, please wait...');
+      return;
     }
 
     try {
       setIsScanning(true);
       setCameraError(null);
-      console.log('handleImageAnalysis: Starting image analysis');
+      setScanResult(null);
+      console.log('Starting capture process...');
+
+      let imageSrc: string | null = null;
+
+      if (cameraSource === 'laptop') {
+        if (!webcamRef.current) {
+          throw new Error('Webcam not ready');
+        }
+        imageSrc = webcamRef.current.getScreenshot();
+        if (!imageSrc) {
+          throw new Error('Failed to capture image from webcam');
+        }
+        console.log('Image captured from webcam');
+      } else if (cameraSource === 'esp32') {
+        if (!esp32ImageUrl) {
+          throw new Error('No ESP32 image available');
+        }
+        imageSrc = esp32ImageUrl;
+        console.log('Using ESP32 image');
+      }
+
+      if (!imageSrc) {
+        throw new Error('No image source available');
+      }
+
+      // Process the image
+      await handleImageAnalysis(imageSrc);
+
+    } catch (error) {
+      console.error('Capture error:', error);
+      setCameraError(error instanceof Error ? error.message : 'Failed to capture image');
+      setScanResult(null);
+    } finally {
+      setIsScanning(false);
+      setEsp32ImageLoading(false);
+    }
+  };
+
+  const handleImageAnalysis = async (imageSrc: string) => {
+    try {
+      console.log('Starting image analysis...');
 
       // Convert base64 to blob
-      console.log('handleImageAnalysis: Converting image to blob...');
       const base64Response = await fetch(imageSrc);
       if (!base64Response.ok) {
         throw new Error(`Failed to process image: ${base64Response.statusText}`);
       }
       const blob = await base64Response.blob();
-      console.log('handleImageAnalysis: Image converted to blob, size:', blob.size);
+      console.log('Image converted to blob');
 
       // Create form data
       const formData = new FormData();
       formData.append('image', blob, 'capture.jpg');
-      console.log('handleImageAnalysis: Sending request to backend...');
 
+      // Send to backend
       const response = await fetch('http://localhost:5000/predict_from_esp32', {
         method: 'POST',
         body: formData,
       });
 
-      console.log('handleImageAnalysis: Received response, status:', response.status);
-      
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`Server error: ${response.status} ${response.statusText} - ${errorText}`);
       }
 
       const data = await response.json();
-      console.log('handleImageAnalysis: Full response data:', JSON.stringify(data, null, 2));
+      console.log('Analysis complete:', data);
 
       if (data.status === 'success') {
-        // Create a more detailed result object
         const result = {
           ...mockSpoilageResult,
           predictedClass: data.predictedClass || 'Unknown',
@@ -316,64 +359,13 @@ export default function SpoilageDetection() {
           status: (data.spoilage_status || 'good').toLowerCase(),
           foodItemName: data.foodItemName || 'Unknown Food Item'
         };
-        
-        console.log('handleImageAnalysis: Processed result:', JSON.stringify(result, null, 2));
         setScanResult(result);
       } else {
         throw new Error(data.message || 'Failed to analyze image');
       }
     } catch (error) {
-      console.error('handleImageAnalysis Error:', error);
-      setCameraError(error instanceof Error ? error.message : 'Failed to analyze image');
-      setScanResult(null);
-    } finally {
-      setIsScanning(false);
-    }
-  };
-
-  const handleCameraCapture = async () => {
-    // Defensive check to ensure button isn't stuck
-    if (isScanning) {
-      console.log('handleCameraCapture: Already scanning, resetting.');
-      setIsScanning(false);
-    }
-
-    setIsScanning(true);
-    setCameraError(null);
-    setScanResult(null); // Clear previous results
-    console.log('handleCameraCapture: Button pressed, initiating capture.');
-
-    try {
-      if (cameraSource === 'laptop') {
-        console.log('handleCameraCapture: Laptop camera selected.');
-        if (!webcamRef.current) {
-          throw new Error('Webcam not ready');
-        }
-        const imageSrc = webcamRef.current.getScreenshot();
-        if (!imageSrc) {
-          throw new Error('Failed to capture image from webcam');
-        }
-        console.log('handleCameraCapture: Image captured from webcam, size:', imageSrc.length, 'bytes.');
-        // Send the captured image to the backend for analysis
-        await handleImageAnalysis(imageSrc);
-      } else if (cameraSource === 'esp32') {
-        console.log('handleCameraCapture: ESP32 camera selected.');
-        // Capture the currently displayed ESP32 image and send it to backend
-        if (!esp32ImageUrl) {
-          throw new Error('No ESP32 image currently displayed');
-        }
-        console.log('handleCameraCapture: ESP32 image URL found:', esp32ImageUrl);
-
-        // Convert the displayed image URL to a blob and send to backend for prediction
-        await handleImageAnalysis(esp32ImageUrl);
-      }
-    } catch (error) {
-      console.error('handleCameraCapture Error:', error);
-      setCameraError(error instanceof Error ? error.message : 'Failed to process image');
-    } finally {
-      setIsScanning(false);
-      setEsp32ImageLoading(false);
-      console.log('handleCameraCapture: Capture process finished.');
+      console.error('Analysis error:', error);
+      throw error; // Re-throw to be caught by handleCameraCapture
     }
   };
 
@@ -479,53 +471,80 @@ export default function SpoilageDetection() {
         </TabsList>
 
         <TabsContent value="camera" className="space-y-6">
-          <div className="flex flex-col md:flex-row gap-6 items-start">
-            <div className="relative rounded-lg overflow-hidden bg-black flex-1">
-              <select value={cameraSource} onChange={e => setCameraSource(e.target.value as 'laptop' | 'esp32')}>
-                {CAMERA_OPTIONS.map(opt => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
-              {cameraSource === 'laptop' ? (
-                <Webcam
-                  ref={webcamRef}
-                  audio={false}
-                  screenshotFormat="image/jpeg"
-                  className="w-full"
-                  videoConstraints={{ deviceId: laptopDeviceId }}
-                  onUserMediaError={(error) => {
-                    setCameraError("Unable to access camera. Please check permissions.");
-                  }}
-                />
-              ) : (
-                <div className="w-full flex flex-col items-center justify-center">
-                  {esp32ImageUrl ? (
-                    <img
-                      src={esp32ImageUrl}
-                      alt="ESP32 Camera"
-                      className="rounded-lg border border-emerald-400 max-w-full max-h-[480px]"
-                      onLoad={() => setEsp32ImageLoading(false)}
-                      onError={() => setEsp32ImageLoading(false)}
-                    />
-                  ) : null}
+          <div className="grid md:grid-cols-3 gap-6">
+            <div className="md:col-span-2">
+              <div className="relative rounded-lg overflow-hidden bg-black" style={{ maxHeight: '400px' }}>
+                <select 
+                  value={cameraSource} 
+                  onChange={e => setCameraSource(e.target.value as 'laptop' | 'esp32')}
+                  className="absolute top-2 right-2 z-10 bg-white/90 rounded px-2 py-1 text-sm"
+                >
+                  {CAMERA_OPTIONS.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+                {cameraSource === 'laptop' ? (
+                  <Webcam
+                    ref={webcamRef}
+                    audio={false}
+                    screenshotFormat="image/jpeg"
+                    className="w-full h-full object-cover"
+                    videoConstraints={{ deviceId: laptopDeviceId }}
+                    onUserMediaError={(error) => {
+                      setCameraError("Unable to access camera. Please check permissions.");
+                    }}
+                  />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center">
+                    {esp32ImageUrl ? (
+                      <img
+                        src={esp32ImageUrl}
+                        alt="ESP32 Camera"
+                        className="w-full h-full object-cover"
+                        onLoad={() => setEsp32ImageLoading(false)}
+                        onError={() => setEsp32ImageLoading(false)}
+                      />
+                    ) : null}
+                  </div>
+                )}
+                <div className="absolute inset-0 border-2 border-emerald-400 rounded-lg pointer-events-none">
+                  <div className="absolute top-4 left-4 w-8 h-8 border-l-2 border-t-2 border-emerald-400"></div>
+                  <div className="absolute top-4 right-4 w-8 h-8 border-r-2 border-t-2 border-emerald-400"></div>
+                  <div className="absolute bottom-4 left-4 w-8 h-8 border-l-2 border-b-2 border-emerald-400"></div>
+                  <div className="absolute bottom-4 right-4 w-8 h-8 border-r-2 border-b-2 border-emerald-400"></div>
                 </div>
-              )}
-              <div className="absolute inset-0 border-2 border-emerald-400 rounded-lg pointer-events-none">
-                <div className="absolute top-4 left-4 w-8 h-8 border-l-2 border-t-2 border-emerald-400"></div>
-                <div className="absolute top-4 right-4 w-8 h-8 border-r-2 border-t-2 border-emerald-400"></div>
-                <div className="absolute bottom-4 left-4 w-8 h-8 border-l-2 border-b-2 border-emerald-400"></div>
-                <div className="absolute bottom-4 right-4 w-8 h-8 border-r-2 border-b-2 border-emerald-400"></div>
+              </div>
+              <div className="text-center mt-4">
+                <Button
+                  onClick={handleCameraCapture}
+                  size="lg"
+                  className="bg-health-gradient"
+                  disabled={!!cameraError || isScanning || isModelLoading}
+                >
+                  {isScanning ? (
+                    <>
+                      <Loader2 className="h-5 w-5 mr-2 animate-spin" />
+                      Analyzing...
+                    </>
+                  ) : (
+                    <>
+                      <Camera className="h-5 w-5 mr-2" />
+                      Capture & Analyze
+                    </>
+                  )}
+                </Button>
               </div>
             </div>
-            {/* Prediction Card - Always visible, displays results when available */}
-            <Card className="w-full md:w-72 bg-white/80 backdrop-blur-sm">
+
+            {/* Prediction Card */}
+            <Card className="w-full bg-white/80 backdrop-blur-sm">
               <CardHeader>
                 <CardTitle className="flex items-center">
                   <Target className="h-5 w-5 mr-2 text-emerald-600" />
                   Prediction
                 </CardTitle>
               </CardHeader>
-              <CardContent className="p-6">
+              <CardContent>
                 {scanResult ? (
                   <div className="text-center mb-4">
                     <div className="text-lg text-emerald-700 font-bold">
@@ -537,9 +556,6 @@ export default function SpoilageDetection() {
                     <div className="text-sm text-gray-600">
                       Confidence: {scanResult.confidence ? `${scanResult.confidence.toFixed(1)}%` : '0%'}
                     </div>
-                    <div className="text-sm text-gray-600">
-                      Freshness: {scanResult.status ? scanResult.status.charAt(0).toUpperCase() + scanResult.status.slice(1) : 'N/A'}
-                    </div>
                   </div>
                 ) : (
                   <div className="text-center">
@@ -550,27 +566,6 @@ export default function SpoilageDetection() {
                 )}
               </CardContent>
             </Card>
-          </div>
-
-          <div className="text-center">
-            <Button
-              onClick={handleCameraCapture}
-              size="lg"
-              className="bg-health-gradient"
-              disabled={!!cameraError || isScanning || isModelLoading}
-            >
-              {isScanning ? (
-                <>
-                  <Scan className="h-5 w-5 mr-2 animate-spin" />
-                  Analyzing...
-                </>
-              ) : (
-                <>
-                  <Camera className="h-5 w-5 mr-2" />
-                  Capture & Analyze
-                </>
-              )}
-            </Button>
           </div>
         </TabsContent>
 
@@ -594,24 +589,38 @@ export default function SpoilageDetection() {
                   onChange={handleFileUpload}
                   className="hidden"
                 />
-                <Upload className="h-12 w-12 text-emerald-400 mx-auto mb-4" />
-                <h3 className="text-lg font-medium text-gray-900 mb-2">
-                  Upload Food Image
-                </h3>
-                <p className="text-gray-600 mb-4">
-                  Choose a clear, well-lit image of your food item
-                </p>
-                <Button
-                  onClick={() => fileInputRef.current?.click()}
-                  className="bg-emerald-600 hover:bg-emerald-700"
-                >
-                  Choose File
-                </Button>
+                {isUploading ? (
+                  <div className="flex flex-col items-center justify-center">
+                    <Loader2 className="h-12 w-12 text-emerald-400 animate-spin mb-4" />
+                    <h3 className="text-lg font-medium text-gray-900 mb-2">
+                      Analyzing Image...
+                    </h3>
+                    <p className="text-gray-600">
+                      Please wait while we process your image
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <Upload className="h-12 w-12 text-emerald-400 mx-auto mb-4" />
+                    <h3 className="text-lg font-medium text-gray-900 mb-2">
+                      Upload Food Image
+                    </h3>
+                    <p className="text-gray-600 mb-4">
+                      Choose a clear, well-lit image of your food item
+                    </p>
+                    <Button
+                      onClick={() => fileInputRef.current?.click()}
+                      className="bg-emerald-600 hover:bg-emerald-700"
+                    >
+                      Choose File
+                    </Button>
+                  </>
+                )}
               </div>
             </CardContent>
           </Card>
 
-          {/* Prediction Results Card */}
+          {/* Results Card */}
           {scanResult && (
             <Card className="bg-white/80 backdrop-blur-sm">
               <CardHeader>
@@ -631,9 +640,6 @@ export default function SpoilageDetection() {
                     </div>
                     <div className="text-sm text-gray-600">
                       Confidence: {scanResult.confidence ? `${scanResult.confidence.toFixed(1)}%` : '0%'}
-                    </div>
-                    <div className="text-sm text-gray-600">
-                      Status: {scanResult.status ? scanResult.status.charAt(0).toUpperCase() + scanResult.status.slice(1) : 'Unknown'}
                     </div>
                   </div>
 
