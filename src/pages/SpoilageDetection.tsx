@@ -103,9 +103,7 @@ const CAMERA_OPTIONS = [
 ];
 
 export default function SpoilageDetection() {
-  const [scanMode, setScanMode] = useState<"camera" | "upload" | "iot">(
-    "camera",
-  );
+  const [scanMode, setScanMode] = useState<"camera" | "upload" | "iot">("camera");
   const [isScanning, setIsScanning] = useState(false);
   const [scanResult, setScanResult] = useState<SpoilageResult | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -113,7 +111,6 @@ export default function SpoilageDetection() {
   const [isLiveMode, setIsLiveMode] = useState(false);
   const [iotData, setIoTData] = useState<IoTSensorData>(mockIoTData);
   const [aiSensitivity, setAiSensitivity] = useState([75]);
-  const [autoScan, setAutoScan] = useState(false);
   const [model, setModel] = useState<mobilenet.MobileNet | null>(null);
   const [isModelLoading, setIsModelLoading] = useState(true);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -125,7 +122,6 @@ export default function SpoilageDetection() {
 
   const webcamRef = useRef<Webcam>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Simulate live IoT data updates
   useEffect(() => {
@@ -140,24 +136,6 @@ export default function SpoilageDetection() {
 
     return () => clearInterval(interval);
   }, []);
-
-  // Auto-scan in live mode
-  useEffect(() => {
-    if (isLiveMode && autoScan) {
-      intervalRef.current = setInterval(() => {
-        handleCameraCapture();
-      }, 10000); // Scan every 10 seconds
-    } else if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-
-    return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
-    };
-  }, [isLiveMode, autoScan]);
 
   useEffect(() => {
     const checkCameraPermission = async () => {
@@ -203,67 +181,158 @@ export default function SpoilageDetection() {
     });
   }, []);
 
+  // Update ESP32 camera handling to fetch and display the live image
   useEffect(() => {
-    let interval: NodeJS.Timeout | null = null;
     if (cameraSource === 'esp32') {
-      const fetchImage = () => {
+      // Continuously fetch the latest image from ESP32 for display
+      const fetchEsp32Image = () => {
         setEsp32ImageLoading(true);
-        // Add a cache-busting timestamp to force refresh
-        const url = `http://localhost:5000/latest_esp32_image?t=${Date.now()}`;
+        // Use a cache-busting timestamp to ensure a fresh image is always fetched
+        const url = `http://192.168.65.102/cam.jpg?t=${Date.now()}`;
         setEsp32ImageUrl(url);
+        // We'll set loading to false in the img onError/onLoad handlers in the JSX
       };
-      fetchImage();
-      interval = setInterval(fetchImage, 2000);
+
+      fetchEsp32Image(); // Fetch immediately when switching to ESP32
+
+      // Set up an interval to continuously refresh the image
+      const interval = setInterval(fetchEsp32Image, 1000); // Refresh every 1 second
+
+      return () => clearInterval(interval); // Clean up interval on unmount or mode change
+    } else {
+      // Clear ESP32 image when not in esp32 mode
+      setEsp32ImageUrl("");
+      setEsp32ImageLoading(false);
     }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
   }, [cameraSource]);
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
-      simulateAnalysis();
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const imageSrc = e.target?.result as string;
+        handleImageAnalysis(imageSrc);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const handleImageAnalysis = async (imageSrc: string) => {
+    // Defensive check to ensure button isn't stuck
+    if (isScanning) {
+      console.log('handleImageAnalysis: Already scanning, resetting.');
+      setIsScanning(false);
+    }
+
+    try {
+      setIsScanning(true);
+      console.log('handleImageAnalysis: Starting image analysis for:', imageSrc);
+
+      // Convert base64 to blob
+      console.log('handleImageAnalysis: Fetching image to convert to blob...');
+      const base64Response = await fetch(imageSrc);
+      if (!base64Response.ok) {
+        const errorDetails = await base64Response.text();
+        throw new Error(`Failed to fetch image for blob conversion (status: ${base64Response.status}): ${errorDetails}`);
+      }
+      const blob = await base64Response.blob();
+      console.log('handleImageAnalysis: Image converted to blob, size:', blob.size);
+
+      // Create form data
+      const formData = new FormData();
+      formData.append('image', blob, 'capture.jpg');
+      console.log('handleImageAnalysis: FormData created.');
+
+      // Send to backend with timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => {
+        controller.abort();
+        console.warn('handleImageAnalysis: Backend request timed out.');
+      }, 10000); // 10 second timeout
+      console.log('handleImageAnalysis: Sending image to backend...');
+
+      const result = await fetch('http://localhost:5000/predict_from_esp32', {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+      console.log('handleImageAnalysis: Received response from backend, status:', result.status);
+
+      if (!result.ok) {
+        const errorText = await result.text();
+        throw new Error(`Failed to get prediction from server: ${result.status} ${result.statusText} - ${errorText}`);
+      }
+
+      const data = await result.json();
+      console.log('handleImageAnalysis: Backend response data:', data);
+
+      if (data.status === 'success') {
+        setScanResult({
+          ...mockSpoilageResult,
+          predictedClass: data.predictedClass,
+          confidence: data.confidence,
+          status: data.spoilage_status?.toLowerCase() || 'good'
+        });
+        console.log('handleImageAnalysis: Scan result updated.');
+      } else {
+        throw new Error(data.message || 'Failed to analyze image');
+      }
+    } catch (error) {
+      console.error('handleImageAnalysis Error:', error);
+      setCameraError(error instanceof Error ? error.message : 'Failed to analyze image');
+    } finally {
+      setIsScanning(false);
+      console.log('handleImageAnalysis: Scanning finished.');
     }
   };
 
   const handleCameraCapture = async () => {
-    const imageSrc = webcamRef.current?.getScreenshot();
-    if (imageSrc && model) {
-      try {
-        setIsScanning(true);
-        const img = new Image();
-        img.src = imageSrc;
-        await img.decode();
-        
-        const predictions = await model.classify(img);
-        console.log('Predictions:', predictions);
-        
-        // Simulate scan with the predictions
-        simulateScan();
-      } catch (error) {
-        console.error('Error analyzing image:', error);
-        setCameraError('Failed to analyze image');
-      }
+    // Defensive check to ensure button isn't stuck
+    if (isScanning) {
+      console.log('handleCameraCapture: Already scanning, resetting.');
+      setIsScanning(false);
     }
-  };
 
-  const simulateAnalysis = () => {
     setIsScanning(true);
-    // Simulate AI analysis time
-    setTimeout(() => {
-      setIsScanning(false);
-      setScanResult(mockSpoilageResult);
-    }, 3000);
-  };
+    setCameraError(null);
+    setScanResult(null); // Clear previous results
+    console.log('handleCameraCapture: Button pressed, initiating capture.');
 
-  const simulateScan = () => {
-    setIsScanning(true);
-    // Simulate AI analysis time
-    setTimeout(() => {
+    try {
+      if (cameraSource === 'laptop') {
+        console.log('handleCameraCapture: Laptop camera selected.');
+        if (!webcamRef.current) {
+          throw new Error('Webcam not ready');
+        }
+        const imageSrc = webcamRef.current.getScreenshot();
+        if (!imageSrc) {
+          throw new Error('Failed to capture image from webcam');
+        }
+        console.log('handleCameraCapture: Image captured from webcam, size:', imageSrc.length, 'bytes.');
+        // Send the captured image to the backend for analysis
+        await handleImageAnalysis(imageSrc);
+      } else if (cameraSource === 'esp32') {
+        console.log('handleCameraCapture: ESP32 camera selected.');
+        // Capture the currently displayed ESP32 image and send it to backend
+        if (!esp32ImageUrl) {
+          throw new Error('No ESP32 image currently displayed');
+        }
+        console.log('handleCameraCapture: ESP32 image URL found:', esp32ImageUrl);
+
+        // Convert the displayed image URL to a blob and send to backend for prediction
+        await handleImageAnalysis(esp32ImageUrl);
+      }
+    } catch (error) {
+      console.error('handleCameraCapture Error:', error);
+      setCameraError(error instanceof Error ? error.message : 'Failed to process image');
+    } finally {
       setIsScanning(false);
-      setScanResult(mockSpoilageResult);
-    }, 3000);
+      setEsp32ImageLoading(false);
+      console.log('handleCameraCapture: Capture process finished.');
+    }
   };
 
   const resetScan = () => {
@@ -365,71 +434,75 @@ export default function SpoilageDetection() {
         </TabsList>
 
         <TabsContent value="camera" className="space-y-6">
-          {!scanResult ? (
-            <div className="flex flex-col md:flex-row gap-6 items-start">
-              <div className="relative rounded-lg overflow-hidden bg-black flex-1">
-                <select value={cameraSource} onChange={e => setCameraSource(e.target.value as 'laptop' | 'esp32')}>
-                  {CAMERA_OPTIONS.map(opt => (
-                    <option key={opt.value} value={opt.value}>{opt.label}</option>
-                  ))}
-                </select>
-                {cameraSource === 'laptop' ? (
-                  <Webcam
-                    ref={webcamRef}
-                    audio={false}
-                    screenshotFormat="image/jpeg"
-                    className="w-full"
-                    videoConstraints={{ deviceId: laptopDeviceId }}
-                    onUserMediaError={(error) => {
-                      setCameraError("Unable to access camera. Please check permissions.");
-                    }}
-                  />
-                ) : (
-                  <div className="w-full flex flex-col items-center justify-center">
-                    {esp32ImageUrl ? (
-                      <img
-                        src={esp32ImageUrl}
-                        alt="ESP32 Camera"
-                        className="rounded-lg border border-emerald-400 max-w-full max-h-[480px]"
-                        onLoad={() => setEsp32ImageLoading(false)}
-                        onError={() => setEsp32ImageLoading(false)}
-                      />
-                    ) : null}
-                    {esp32ImageLoading && <div className="text-gray-500 mt-2">Loading image...</div>}
-                  </div>
-                )}
-                <div className="absolute inset-0 border-2 border-emerald-400 rounded-lg pointer-events-none">
-                  <div className="absolute top-4 left-4 w-8 h-8 border-l-2 border-t-2 border-emerald-400"></div>
-                  <div className="absolute top-4 right-4 w-8 h-8 border-r-2 border-t-2 border-emerald-400"></div>
-                  <div className="absolute bottom-4 left-4 w-8 h-8 border-l-2 border-b-2 border-emerald-400"></div>
-                  <div className="absolute bottom-4 right-4 w-8 h-8 border-r-2 border-b-2 border-emerald-400"></div>
+          <div className="flex flex-col md:flex-row gap-6 items-start">
+            <div className="relative rounded-lg overflow-hidden bg-black flex-1">
+              <select value={cameraSource} onChange={e => setCameraSource(e.target.value as 'laptop' | 'esp32')}>
+                {CAMERA_OPTIONS.map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+              {cameraSource === 'laptop' ? (
+                <Webcam
+                  ref={webcamRef}
+                  audio={false}
+                  screenshotFormat="image/jpeg"
+                  className="w-full"
+                  videoConstraints={{ deviceId: laptopDeviceId }}
+                  onUserMediaError={(error) => {
+                    setCameraError("Unable to access camera. Please check permissions.");
+                  }}
+                />
+              ) : (
+                <div className="w-full flex flex-col items-center justify-center">
+                  {esp32ImageUrl ? (
+                    <img
+                      src={esp32ImageUrl}
+                      alt="ESP32 Camera"
+                      className="rounded-lg border border-emerald-400 max-w-full max-h-[480px]"
+                      onLoad={() => setEsp32ImageLoading(false)}
+                      onError={() => setEsp32ImageLoading(false)}
+                    />
+                  ) : null}
                 </div>
+              )}
+              <div className="absolute inset-0 border-2 border-emerald-400 rounded-lg pointer-events-none">
+                <div className="absolute top-4 left-4 w-8 h-8 border-l-2 border-t-2 border-emerald-400"></div>
+                <div className="absolute top-4 right-4 w-8 h-8 border-r-2 border-t-2 border-emerald-400"></div>
+                <div className="absolute bottom-4 left-4 w-8 h-8 border-l-2 border-b-2 border-emerald-400"></div>
+                <div className="absolute bottom-4 right-4 w-8 h-8 border-r-2 border-b-2 border-emerald-400"></div>
               </div>
-              <Card className="w-full md:w-72 bg-white/80 backdrop-blur-sm">
-                <CardHeader>
-                  <CardTitle className="flex items-center">
-                    <Target className="h-5 w-5 mr-2 text-emerald-600" />
-                    Prediction
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="p-6">
+            </div>
+            {/* Prediction Card - Always visible, displays results when available */}
+            <Card className="w-full md:w-72 bg-white/80 backdrop-blur-sm">
+              <CardHeader>
+                <CardTitle className="flex items-center">
+                  <Target className="h-5 w-5 mr-2 text-emerald-600" />
+                  Prediction
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="p-6">
+                {scanResult ? (
                   <div className="text-center mb-4">
                     <div className="text-lg text-emerald-700 font-bold">
-                      {scanResult?.predictedClass || 'N/A'}
+                      {scanResult.predictedClass || 'N/A'}
                     </div>
                     <div className="text-sm text-gray-600">
-                      Confidence: {scanResult?.confidence ? `${scanResult.confidence.toFixed(1)}%` : '0%'}
+                      Confidence: {scanResult.confidence ? `${scanResult.confidence.toFixed(1)}%` : '0%'}
                     </div>
-                    {!scanResult && (
-                      <div className="text-xs text-gray-500 mt-2">
-                        Connect camera and start prediction
-                      </div>
-                    )}
+                    <div className="text-sm text-gray-600">
+                      Freshness: {scanResult.status ? scanResult.status.charAt(0).toUpperCase() + scanResult.status.slice(1) : 'N/A'}
+                    </div>
                   </div>
-                </CardContent>
-              </Card>
-            </div>
-          ) : null}
+                ) : (
+                  <div className="text-center">
+                    <div className="text-xs text-gray-500 mt-2">
+                      Connect camera and start prediction
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
 
           <div className="text-center">
             <Button

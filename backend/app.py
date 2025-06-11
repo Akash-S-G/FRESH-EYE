@@ -9,6 +9,7 @@ import io
 from nutrition_extraction import extract_nutrition
 from dotenv import load_dotenv
 import requests
+from flask_cors import CORS
 
 # Load environment variables from .env
 load_dotenv()
@@ -16,6 +17,7 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + GEMINI_API_KEY if GEMINI_API_KEY else None
 
 app = Flask(__name__)
+CORS(app, resources={r"/*":{"origins":["http://localhost:5173"]}})
 
 UPLOAD_FOLDER = 'uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -92,7 +94,7 @@ def predict_with_gemini(image_bytes):
             "contents": [
                 {
                     "parts": [
-                        {"text": "Classify the food item in this image as fresh or spoiled. Respond with a JSON object: {predictedClass: <class>, confidence: <confidence as a float between 0 and 1>}"},
+                        {"text": "Classify the food item in this image as fresh or spoiled.and predict the food item Respond with a JSON object: {predictedClass: <class>, confidence: <confidence as a float between 0 and 1> ,food_item: <food item name>}"},
                         {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}}
                     ]
                 }
