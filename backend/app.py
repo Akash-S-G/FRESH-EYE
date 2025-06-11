@@ -207,14 +207,81 @@ def get_latest_prediction_result():
         print(f"Error processing latest image for prediction: {e}")
         return jsonify({"status": "error", "message": f"Failed to get latest prediction: {str(e)}"}), 500
 
+def analyze_nutrition_with_gemini(text):
+    if not GEMINI_API_KEY or not GEMINI_API_URL:
+        return None
+    try:
+        prompt = """Analyze this nutrition label text and extract the following information in JSON format:
+        {
+            "calories": number,
+            "protein": number,
+            "carbs": number,
+            "fat": number,
+            "fiber": number,
+            "sugar": number,
+            "sodium": number,
+            "serving_size": string,
+            "ingredients": string[],
+            "health_score": number (0-10),
+            "benefits": string[],
+            "warnings": string[]
+        }
+        Calculate health_score based on:
+        - High protein and fiber are good
+        - High sugar, sodium, and fat are bad
+        - Consider serving size in calculations
+        List benefits and warnings based on the nutritional values.
+        Text to analyze: """
+        
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt + text}
+                    ]
+                }
+            ]
+        }
+        response = requests.post(GEMINI_API_URL, json=payload)
+        if response.status_code == 200:
+            try:
+                text = response.json()['candidates'][0]['content']['parts'][0]['text']
+                import re, json as pyjson
+                match = re.search(r'\{.*\}', text, re.DOTALL)
+                if match:
+                    return pyjson.loads(match.group(0))
+            except Exception as e:
+                print(f"Error parsing Gemini nutrition response: {e}")
+        else:
+            print(f"Gemini API error: {response.status_code} {response.text}")
+    except Exception as e:
+        print(f"Error calling Gemini API for nutrition: {e}")
+    return None
+
 @app.route('/extract_nutrition', methods=['POST'])
 def extract_nutrition_api():
     data = request.get_json()
     if not data or 'text' not in data:
         return jsonify({'status': 'error', 'message': 'No text provided'}), 400
+    
     text = data['text']
+    
+    # Try Gemini API first
+    gemini_result = analyze_nutrition_with_gemini(text)
+    if gemini_result:
+        return jsonify({
+            'status': 'success',
+            'nutrition': gemini_result,
+            'source': 'gemini'
+        })
+    
+    # Fallback to local extraction
     nutrition = extract_nutrition(text)
-    return jsonify({'status': 'success', 'nutrition': nutrition})
+    return jsonify({
+        'status': 'success',
+        'nutrition': nutrition,
+        'source': 'local'
+    })
 
 @app.route('/get_iot_data')
 def get_iot_data():
