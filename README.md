@@ -1,11 +1,3 @@
-Ran tool
-Ran tool
-Ran tool
-Ran tool
-Ran tool
-Ran tool
-Read file: backend/requirements.txt
-Here is a comprehensive README for your project, covering backend, frontend, and IoT integration:
 
 ---
 
