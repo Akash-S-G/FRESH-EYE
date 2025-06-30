@@ -122,6 +122,13 @@ export default function SpoilageDetection() {
   const [esp32ImageUrl, setEsp32ImageUrl] = useState<string>("");
   const [esp32ImageLoading, setEsp32ImageLoading] = useState<boolean>(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadedImage, setUploadedImage] = useState<string | null>(null);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [esp32FeedUrl, setEsp32FeedUrl] = useState("");
+  const ESP32_IP = "192.168.110.102"; // <-- Set your ESP32 IP here
+  const [resultSource, setResultSource] = useState('ollama');
+  const [ollamaResult, setOllamaResult] = useState(null);
+  const [backendResponse, setBackendResponse] = useState(null);
 
   const webcamRef = useRef<Webcam>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -226,28 +233,14 @@ export default function SpoilageDetection() {
     });
   }, []);
 
-  // Update ESP32 camera handling to fetch and display the live image
   useEffect(() => {
-    if (cameraSource === 'esp32') {
-      // Continuously fetch the latest image from ESP32 for display
-      const fetchEsp32Image = () => {
-        setEsp32ImageLoading(true);
-        // Use a cache-busting timestamp to ensure a fresh image is always fetched
-        const url = `http://192.168.65.102/cam.jpg?t=${Date.now()}`;
-        setEsp32ImageUrl(url);
-        // We'll set loading to false in the img onError/onLoad handlers in the JSX
+    if (cameraSource === "esp32") {
+      const updateFeed = () => {
+        setEsp32FeedUrl(`http://${ESP32_IP}/capture?t=${Date.now()}`);
       };
-
-      fetchEsp32Image(); // Fetch immediately when switching to ESP32
-
-      // Set up an interval to continuously refresh the image
-      const interval = setInterval(fetchEsp32Image, 1000); // Refresh every 1 second
-
-      return () => clearInterval(interval); // Clean up interval on unmount or mode change
-    } else {
-      // Clear ESP32 image when not in esp32 mode
-      setEsp32ImageUrl("");
-      setEsp32ImageLoading(false);
+      updateFeed();
+      const interval = setInterval(updateFeed, 1000); // 1 frame per second
+      return () => clearInterval(interval);
     }
   }, [cameraSource]);
 
@@ -260,9 +253,7 @@ export default function SpoilageDetection() {
       reader.onload = (e) => {
         const imageSrc = e.target?.result as string;
         console.log('Image loaded, size:', imageSrc.length);
-        handleImageAnalysis(imageSrc).finally(() => {
-          setIsUploading(false);
-        });
+        setUploadedImage(imageSrc);
       };
       reader.onerror = (error) => {
         console.error('Error reading file:', error);
@@ -296,20 +287,19 @@ export default function SpoilageDetection() {
           throw new Error('Failed to capture image from webcam');
         }
         console.log('Image captured from webcam');
+        setCapturedImage(imageSrc);
       } else if (cameraSource === 'esp32') {
         if (!esp32ImageUrl) {
           throw new Error('No ESP32 image available');
         }
         imageSrc = esp32ImageUrl;
         console.log('Using ESP32 image');
+        setCapturedImage(esp32ImageUrl);
       }
 
       if (!imageSrc) {
         throw new Error('No image source available');
       }
-
-      // Process the image
-      await handleImageAnalysis(imageSrc);
 
     } catch (error) {
       console.error('Capture error:', error);
@@ -351,15 +341,11 @@ export default function SpoilageDetection() {
       const data = await response.json();
       console.log('Analysis complete:', data);
 
-      if (data.status === 'success') {
-        const result = {
-          ...mockSpoilageResult,
-          predictedClass: data.predictedClass || 'Unknown',
-          confidence: data.confidence || 0,
-          status: (data.spoilage_status || 'good').toLowerCase(),
-          foodItemName: data.foodItemName || 'Unknown Food Item'
-        };
+      if (data.status === 'success' && (data.api_result || data.ollama_result)) {
+        const result = data.api_result || data.ollama_result;
         setScanResult(result);
+      } else if (data.status === 'success' && data.predictedClass) {
+        setScanResult(data);
       } else {
         throw new Error(data.message || 'Failed to analyze image');
       }
@@ -369,8 +355,23 @@ export default function SpoilageDetection() {
     }
   };
 
+  const handleAnalyze = async (imageSrc: string) => {
+    setIsScanning(true);
+    setCameraError(null);
+    setScanResult(null);
+    try {
+      await handleImageAnalysis(imageSrc);
+    } catch (error) {
+      setCameraError(error instanceof Error ? error.message : 'Failed to analyze image');
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
   const resetScan = () => {
     setScanResult(null);
+    setUploadedImage(null);
+    setCapturedImage(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -411,8 +412,12 @@ export default function SpoilageDetection() {
     }
   };
 
+  const fetchEsp32Image = () => {
+    setEsp32ImageUrl(`http://localhost:5000/latest_esp32_image?t=${Date.now()}`);
+  };
+
   return (
-    <div className="container mx-auto px-4 py-8 max-w-7xl">
+    <div className="container mx-auto px-4 py-8 max-w-7xl pb-32">
       {/* Header */}
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8">
         <div>
@@ -473,99 +478,135 @@ export default function SpoilageDetection() {
         <TabsContent value="camera" className="space-y-6">
           <div className="grid md:grid-cols-3 gap-6">
             <div className="md:col-span-2">
-              <div className="relative rounded-lg overflow-hidden bg-black" style={{ maxHeight: '400px' }}>
+              <div className="relative rounded-lg overflow-hidden bg-black overflow-y-auto" style={{ maxHeight: '80vh' }}>
                 <select 
                   value={cameraSource} 
                   onChange={e => setCameraSource(e.target.value as 'laptop' | 'esp32')}
-                  className="absolute top-2 right-2 z-10 bg-white/90 rounded px-2 py-1 text-sm"
+                  className="absolute top-2 left-2 z-10 bg-white/90 rounded px-2 py-1 text-sm"
                 >
                   {CAMERA_OPTIONS.map(opt => (
                     <option key={opt.value} value={opt.value}>{opt.label}</option>
                   ))}
                 </select>
-                {cameraSource === 'laptop' ? (
-                  <Webcam
-                    ref={webcamRef}
-                    audio={false}
-                    screenshotFormat="image/jpeg"
-                    className="w-full h-full object-cover"
-                    videoConstraints={{ deviceId: laptopDeviceId }}
-                    onUserMediaError={(error) => {
-                      setCameraError("Unable to access camera. Please check permissions.");
-                    }}
-                  />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center">
-                    {esp32ImageUrl ? (
-                      <img
-                        src={esp32ImageUrl}
-                        alt="ESP32 Camera"
+                <div className="relative w-full h-full flex flex-col items-center justify-center">
+                  {cameraSource === 'laptop' ? (
+                    hasPermission === false ? (
+                      <div className="text-red-600 mt-4">Unable to access camera. Please check permissions.</div>
+                    ) : (
+                      <Webcam
+                        ref={webcamRef}
+                        audio={false}
+                        screenshotFormat="image/jpeg"
                         className="w-full h-full object-cover"
-                        onLoad={() => setEsp32ImageLoading(false)}
-                        onError={() => setEsp32ImageLoading(false)}
+                        videoConstraints={{ deviceId: laptopDeviceId }}
                       />
-                    ) : null}
-                  </div>
-                )}
-                <div className="absolute inset-0 border-2 border-emerald-400 rounded-lg pointer-events-none">
-                  <div className="absolute top-4 left-4 w-8 h-8 border-l-2 border-t-2 border-emerald-400"></div>
-                  <div className="absolute top-4 right-4 w-8 h-8 border-r-2 border-t-2 border-emerald-400"></div>
-                  <div className="absolute bottom-4 left-4 w-8 h-8 border-l-2 border-b-2 border-emerald-400"></div>
-                  <div className="absolute bottom-4 right-4 w-8 h-8 border-r-2 border-b-2 border-emerald-400"></div>
+                    )
+                  ) : (
+                    <img
+                      src={esp32FeedUrl}
+                      alt="ESP32 Live Feed"
+                      className="w-full h-auto object-contain"
+                      style={{ maxHeight: '60vh', width: 'auto', maxWidth: '100%' }}
+                    />
+                  )}
+                  {cameraError && <div className="text-red-600 mt-2">{cameraError}</div>}
                 </div>
               </div>
-              <div className="text-center mt-4">
+              <div className="flex flex-col items-center w-full mt-4">
                 <Button
-                  onClick={handleCameraCapture}
-                  size="lg"
-                  className="bg-health-gradient"
-                  disabled={!!cameraError || isScanning || isModelLoading}
+                  className="bg-blue-600 hover:bg-blue-700"
+                  onClick={async () => {
+                    if (cameraSource === 'laptop') {
+                      if (!webcamRef.current) return;
+                      const imageSrc = webcamRef.current.getScreenshot();
+                      if (!imageSrc) {
+                        setCameraError('Failed to capture image.');
+                        return;
+                      }
+                      setCapturedImage(imageSrc);
+                    } else {
+                      // ESP32
+                      const response = await fetch(esp32FeedUrl.replace(/\?.*$/, ''));
+                      const blob = await response.blob();
+                      const reader = new FileReader();
+                      reader.onloadend = () => {
+                        setCapturedImage(reader.result as string);
+                      };
+                      reader.readAsDataURL(blob);
+                    }
+                  }}
+                  disabled={isScanning || (cameraSource === 'laptop' && hasPermission === false)}
                 >
-                  {isScanning ? (
-                    <>
-                      <Loader2 className="h-5 w-5 mr-2 animate-spin" />
-                      Analyzing...
-                    </>
-                  ) : (
-                    <>
-                      <Camera className="h-5 w-5 mr-2" />
-                      Capture & Analyze
-                    </>
-                  )}
+                  Capture
                 </Button>
+                {capturedImage && (
+                  <div className="mt-4 flex flex-col items-center w-full">
+                    <div className="relative w-full flex justify-center items-center border rounded bg-white" style={{ maxHeight: '60vh', minHeight: '200px' }}>
+                      <img
+                        src={capturedImage}
+                        alt="Captured food item"
+                        className="object-contain w-full h-auto"
+                        style={{ maxHeight: '60vh', width: 'auto', maxWidth: '100%' }}
+                      />
+                    </div>
+                    <Button
+                      className="mt-4 bg-emerald-600 hover:bg-emerald-700"
+                      onClick={() => handleAnalyze(capturedImage)}
+                      disabled={isScanning}
+                    >
+                      {isScanning ? (
+                        <>
+                          <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                          Analyzing...
+                        </>
+                      ) : (
+                        <>
+                          <Scan className="h-4 w-4 mr-2" />
+                          Analyze
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                )}
               </div>
             </div>
 
-            {/* Prediction Card */}
-            <Card className="w-full bg-white/80 backdrop-blur-sm">
-              <CardHeader>
-                <CardTitle className="flex items-center">
-                  <Target className="h-5 w-5 mr-2 text-emerald-600" />
-                  Prediction
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                {scanResult ? (
-                  <div className="text-center mb-4">
-                    <div className="text-lg text-emerald-700 font-bold">
-                      {scanResult.foodItemName || 'N/A'}
+            {scanMode === 'camera' && (
+              <Card className="w-full bg-white/80 backdrop-blur-sm">
+                <CardHeader>
+                  <CardTitle className="flex items-center">
+                    <Target className="h-5 w-5 mr-2 text-emerald-600" />
+                    Prediction
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  {scanResult ? (
+                    <div className="space-y-4">
+                      <div className="text-center">
+                        <div className="text-lg text-emerald-700 font-bold">
+                          {scanResult.foodItemName || 'N/A'}
+                        </div>
+                        <div className="text-sm text-gray-600">
+                          Prediction: {scanResult.predictedClass || 'N/A'}
+                        </div>
+                        <div className="text-sm text-gray-600">
+                          Confidence: {scanResult.confidence ? `${scanResult.confidence}%` : '0%'}
+                        </div>
+                        <div className="text-sm text-gray-600">
+                          Status: {scanResult.status || 'N/A'}
+                        </div>
+                      </div>
                     </div>
-                    <div className="text-sm text-gray-600">
-                      Prediction: {scanResult.predictedClass || 'N/A'}
+                  ) : (
+                    <div className="text-center">
+                      <div className="text-xs text-gray-500 mt-2">
+                        Connect camera and start prediction
+                      </div>
                     </div>
-                    <div className="text-sm text-gray-600">
-                      Confidence: {scanResult.confidence ? `${scanResult.confidence.toFixed(1)}%` : '0%'}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="text-center">
-                    <div className="text-xs text-gray-500 mt-2">
-                      Connect camera and start prediction
-                    </div>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
+                  )}
+                </CardContent>
+              </Card>
+            )}
           </div>
         </TabsContent>
 
@@ -621,59 +662,99 @@ export default function SpoilageDetection() {
           </Card>
 
           {/* Results Card */}
-          {scanResult && (
-            <Card className="bg-white/80 backdrop-blur-sm">
+          {uploadedImage && (
+            <div className="mb-4 flex flex-col items-center w-full">
+              <h4 className="font-medium text-gray-900 mb-2">Uploaded Image</h4>
+              <div className="relative rounded-lg overflow-hidden border border-gray-200 w-full flex justify-center" style={{ maxHeight: '70vh' }}>
+                <img
+                  src={uploadedImage}
+                  alt="Uploaded food item"
+                  className="object-contain w-full h-auto"
+                  style={{ maxHeight: '70vh', width: 'auto', maxWidth: '100%' }}
+                />
+              </div>
+              <Button
+                className="mt-4 bg-emerald-600 hover:bg-emerald-700"
+                onClick={async () => {
+                  setIsScanning(true);
+                  setCameraError(null);
+                  setOllamaResult(null);
+                  setBackendResponse(null);
+                  try {
+                    // Convert base64 to blob
+                    const base64Response = await fetch(uploadedImage);
+                    if (!base64Response.ok) {
+                      throw new Error(`Failed to process image: ${base64Response.statusText}`);
+                    }
+                    const blob = await base64Response.blob();
+                    // Create form data
+                    const formData = new FormData();
+                    formData.append('image', blob, 'upload.jpg');
+                    // Send to backend for prediction
+                    const response = await fetch('http://localhost:5000/predict_from_esp32', {
+                      method: 'POST',
+                      body: formData,
+                    });
+                    const data = await response.json();
+                    setBackendResponse(data);
+                    if (data.status === 'success' && (data.api_result || data.ollama_result)) {
+                      const result = data.api_result || data.ollama_result;
+                      setOllamaResult(result);
+                      setScanResult(result);
+                    } else if (data.status === 'success' && data.predictedClass) {
+                      // Flat result from backend
+                      setOllamaResult(data);
+                      setScanResult(data);
+                    } else if (data.raw_response) {
+                      setOllamaResult(null);
+                    }
+                  } catch (err) {
+                    setCameraError('Failed to analyze food item. Please try again with a clear image.');
+                  } finally {
+                    setIsScanning(false);
+                  }
+                }}
+                disabled={isScanning}
+              >
+                {isScanning ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Analyzing...
+                  </>
+                ) : (
+                  <>
+                    <Scan className="h-4 w-4 mr-2" />
+                    Analyze
+                  </>
+                )}
+              </Button>
+            </div>
+          )}
+
+          {scanMode === 'upload' && uploadedImage && scanResult && (
+            <Card className="w-full bg-white/80 backdrop-blur-sm mt-6">
               <CardHeader>
                 <CardTitle className="flex items-center">
                   <Target className="h-5 w-5 mr-2 text-emerald-600" />
-                  Analysis Results
+                  Prediction
                 </CardTitle>
               </CardHeader>
               <CardContent>
                 <div className="space-y-4">
                   <div className="text-center">
-                    <div className="text-lg font-bold text-emerald-700">
-                      {scanResult.foodItemName || 'Unknown Food Item'}
+                    <div className="text-lg text-emerald-700 font-bold">
+                      {scanResult.foodItemName || 'N/A'}
                     </div>
                     <div className="text-sm text-gray-600">
-                      Prediction: {scanResult.predictedClass || 'Unknown'}
+                      Prediction: {scanResult.predictedClass || 'N/A'}
                     </div>
                     <div className="text-sm text-gray-600">
-                      Confidence: {scanResult.confidence ? `${scanResult.confidence.toFixed(1)}%` : '0%'}
+                      Confidence: {scanResult.confidence ? `${scanResult.confidence}%` : '0%'}
+                    </div>
+                    <div className="text-sm text-gray-600">
+                      Status: {scanResult.status || 'N/A'}
                     </div>
                   </div>
-
-                  {scanResult.indicators && scanResult.indicators.length > 0 && (
-                    <div className="mt-4">
-                      <h4 className="font-medium text-gray-900 mb-2">Indicators</h4>
-                      <div className="space-y-2">
-                        {scanResult.indicators.map((indicator, index) => (
-                          <div key={index} className="flex items-start space-x-2">
-                            <div className={`w-2 h-2 rounded-full mt-2 ${
-                              indicator.severity === 'low' ? 'bg-green-500' :
-                              indicator.severity === 'medium' ? 'bg-yellow-500' :
-                              'bg-red-500'
-                            }`} />
-                            <div>
-                              <div className="text-sm font-medium">{indicator.type}</div>
-                              <div className="text-sm text-gray-600">{indicator.description}</div>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {scanResult.recommendations && scanResult.recommendations.length > 0 && (
-                    <div className="mt-4">
-                      <h4 className="font-medium text-gray-900 mb-2">Recommendations</h4>
-                      <ul className="list-disc list-inside space-y-1">
-                        {scanResult.recommendations.map((rec, index) => (
-                          <li key={index} className="text-sm text-gray-600">{rec}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
                 </div>
               </CardContent>
             </Card>

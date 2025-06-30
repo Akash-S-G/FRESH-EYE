@@ -100,14 +100,49 @@ async function parseNutritionFromText(text: string): Promise<NutritionData> {
     .then(response => response.json())
     .then(data => {
       if (data.status === 'success') {
-        return data.nutrition;
+        const n = data.nutrition;
+        // Normalize main nutrients to numbers
+        return {
+          ...n,
+          calories: Number(n.calories) || 0,
+          protein: Number(n.protein) || 0,
+          carbs: Number(n.carbs) || 0,
+          fat: Number(n.fat) || 0,
+          fiber: Number(n.fiber) || 0,
+          sugar: Number(n.sugar) || 0,
+          sodium: Number(n.sodium) || 0,
+        };
       }
       throw new Error(data.message || 'Failed to parse nutrition data');
     });
 }
 
+// Custom label renderer for Pie chart
+const renderCustomizedLabel = (props: any) => {
+  const { cx, cy, midAngle, outerRadius, percent, name, value } = props;
+  if (!value || percent === 0) return null; // Hide label for zero values
+  const RADIAN = Math.PI / 180;
+  const radius = outerRadius + 24;
+  const x = cx + radius * Math.cos(-midAngle * RADIAN);
+  const y = cy + radius * Math.sin(-midAngle * RADIAN);
+
+  return (
+    <text
+      x={x}
+      y={y}
+      fill="#333"
+      textAnchor={x > cx ? 'start' : 'end'}
+      dominantBaseline="central"
+      fontSize={14}
+      fontWeight={500}
+    >
+      {`${name}: ${(percent * 100).toFixed(0)}%`}
+    </text>
+  );
+};
+
 export default function ScanLabel() {
-  const [scanMode, setScanMode] = useState<"upload" | "camera">("upload");
+  const [scanMode, setScanMode] = useState<"upload" | "camera" | "esp32">("upload");
   const [isScanning, setIsScanning] = useState(false);
   const [scanResult, setScanResult] = useState<NutritionData | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -119,6 +154,14 @@ export default function ScanLabel() {
   const [videoConstraints, setVideoConstraints] = useState<any>({ facingMode: "environment" });
   const [processingStatus, setProcessingStatus] = useState<string | null>(null);
   const [emailStatus, setEmailStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const [uploadedImage, setUploadedImage] = useState<string | null>(null);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [esp32Image, setEsp32Image] = useState<string | null>(null);
+  const [esp32ImageLoading, setEsp32ImageLoading] = useState<boolean>(false);
+  const [ocrText, setOcrText] = useState<string | null>(null);
+  const [apiResult, setApiResult] = useState(null);
+  const [ollamaResult, setOllamaResult] = useState(null);
+  const [backendResponse, setBackendResponse] = useState(null);
 
   useEffect(() => {
     const checkCameraPermission = async () => {
@@ -168,72 +211,17 @@ export default function ScanLabel() {
 
   const handleCapture = async () => {
     if (!webcamRef.current) return;
-    
     try {
       setIsScanning(true);
       setCameraError(null);
       setProcessingStatus('Capturing image...');
-      
       // Get the current frame from the webcam
       const imageSrc = webcamRef.current.getScreenshot();
       if (!imageSrc) {
         throw new Error('Failed to capture image');
       }
-
-      // Convert base64 to blob for better quality
-      const response = await fetch(imageSrc);
-      const blob = await response.blob();
-      
-      // Create a new image to get dimensions
-      const img = new Image();
-      img.src = imageSrc;
-      await new Promise((resolve) => {
-        img.onload = resolve;
-      });
-
-      // Create a canvas to process the image
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error('Failed to get canvas context');
-
-      // Set canvas size to match image
-      canvas.width = img.width;
-      canvas.height = img.height;
-
-      // Draw image with white background
-      ctx.fillStyle = 'white';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0);
-
-      // Convert to blob with better quality
-      const processedBlob = await new Promise<Blob>((resolve) => {
-        canvas.toBlob((blob) => {
-          if (blob) resolve(blob);
-        }, 'image/jpeg', 0.95);
-      });
-
-      // Convert blob to base64
-      const reader = new FileReader();
-      const base64Image = await new Promise<string>((resolve) => {
-        reader.onloadend = () => resolve(reader.result as string);
-        reader.readAsDataURL(processedBlob);
-      });
-
-      setProcessingStatus('Processing image...');
-      
-      // Process the image
-      const result = await Tesseract.recognize(base64Image, 'eng', { 
-        logger: m => console.log(m),
-        // @ts-ignore - Tesseract types are incomplete
-        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,:;()[]{}%/-+ ',
-        tessedit_pageseg_mode: '6'
-      });
-      
-      setProcessingStatus('Analyzing nutrition information...');
-      
-      const nutrition = await parseNutritionFromText(result.data.text);
-      setScanResult(nutrition);
-      
+      setCapturedImage(imageSrc);
+      // Do NOT run OCR or backend analysis here
     } catch (err) {
       console.error('Camera capture error:', err);
       setCameraError('Failed to capture image. Please try again with better lighting and focus.');
@@ -249,7 +237,8 @@ export default function ScanLabel() {
       const reader = new FileReader();
       reader.onload = (e) => {
         const imageSrc = e.target?.result as string;
-        runOcrAndParse(imageSrc);
+        setUploadedImage(imageSrc);
+        // Do NOT run OCR or backend analysis here
       };
       reader.readAsDataURL(file);
     }
@@ -260,19 +249,17 @@ export default function ScanLabel() {
     setCameraError(null);
     try {
       setScanResult(null);
-      
+      setOcrText(null);
+      setBackendResponse(null);
       const result = await Tesseract.recognize(imageSrc, 'eng', { 
-        logger: m => console.log(m),
-        // @ts-ignore - Tesseract types are incomplete
-        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,:;()[]{}%/-+ ',
-        tessedit_pageseg_mode: '6'
+        logger: m => console.log(m)
       });
       const text = result.data.text;
-      
+      setOcrText(text);
       setProcessingStatus('Analyzing nutrition information...');
-      
       const nutrition = await parseNutritionFromText(text);
       setScanResult(nutrition);
+      setBackendResponse(nutrition);
     } catch (err) {
       console.error('OCR Error:', err);
       setCameraError('Failed to analyze nutrition label. Please try again with better lighting and focus.');
@@ -284,6 +271,8 @@ export default function ScanLabel() {
 
   const resetScan = () => {
     setScanResult(null);
+    setUploadedImage(null);
+    setCapturedImage(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -328,6 +317,33 @@ export default function ScanLabel() {
     }
   };
 
+  // Fetch ESP32 image from backend
+  const fetchEsp32Image = async () => {
+    setEsp32ImageLoading(true);
+    setCameraError(null);
+    try {
+      const response = await fetch('http://localhost:5000/latest_esp32_image');
+      if (!response.ok) throw new Error('Failed to fetch ESP32 image');
+      const blob = await response.blob();
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setEsp32Image(reader.result as string);
+        setEsp32ImageLoading(false);
+      };
+      reader.readAsDataURL(blob);
+    } catch (err) {
+      setCameraError('Could not fetch ESP32 image.');
+      setEsp32ImageLoading(false);
+    }
+  };
+
+  // Analyze ESP32 image
+  const handleEsp32Analyze = () => {
+    if (esp32Image) {
+      runOcrAndParse(esp32Image);
+    }
+  };
+
   return (
     <div className="container mx-auto px-4 py-8 max-w-6xl">
       <div className="text-center mb-8">
@@ -357,10 +373,10 @@ export default function ScanLabel() {
               <Tabs
                 value={scanMode}
                 onValueChange={(value) =>
-                  setScanMode(value as "upload" | "camera")
+                  setScanMode(value as "upload" | "camera" | "esp32")
                 }
               >
-                <TabsList className="grid w-full grid-cols-2">
+                <TabsList className="grid w-full grid-cols-3">
                   <TabsTrigger value="upload" className="flex items-center">
                     <Upload className="h-4 w-4 mr-2" />
                     Upload Image
@@ -368,6 +384,10 @@ export default function ScanLabel() {
                   <TabsTrigger value="camera" className="flex items-center">
                     <Camera className="h-4 w-4 mr-2" />
                     Use Camera
+                  </TabsTrigger>
+                  <TabsTrigger value="esp32" className="flex items-center">
+                    <Camera className="h-4 w-4 mr-2" />
+                    Use ESP32
                   </TabsTrigger>
                 </TabsList>
 
@@ -394,91 +414,189 @@ export default function ScanLabel() {
                       Choose File
                     </Button>
                   </div>
+                  {uploadedImage && (
+                    <div className="mb-4 flex flex-col items-center">
+                      <h4 className="font-medium text-gray-900 mb-2">Uploaded Image</h4>
+                      <div className="relative rounded-lg overflow-hidden border border-gray-200 max-w-xs w-full flex justify-center">
+                        <img
+                          src={uploadedImage}
+                          alt="Uploaded nutrition label"
+                          className="object-contain w-full h-auto max-h-80"
+                          style={{ maxWidth: '100%', height: 'auto' }}
+                        />
+                      </div>
+                      <Button
+                        className="mt-4 bg-emerald-600 hover:bg-emerald-700"
+                        onClick={async () => {
+                          setIsScanning(true);
+                          setCameraError(null);
+                          setApiResult(null);
+                          setOllamaResult(null);
+                          setBackendResponse(null);
+                          try {
+                            const result = await Tesseract.recognize(uploadedImage, 'eng', { logger: m => console.log(m) });
+                            const text = result.data.text;
+                            setOcrText(text);
+                            setProcessingStatus('Analyzing nutrition information...');
+                            const response = await fetch('http://localhost:5000/extract_nutrition', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ text }),
+                            });
+                            const data = await response.json();
+                            setBackendResponse(data);
+                            if (data.status === 'success') {
+                              if (data.source === 'api' && data.nutrition) {
+                                setApiResult(data.nutrition);
+                                setScanResult(data.nutrition);
+                              } else if (data.source === 'ollama' && data.ollama_result) {
+                                setOllamaResult(data.ollama_result);
+                                setScanResult(data.ollama_result);
+                              } else if (data.raw_response) {
+                                setOllamaResult(null);
+                                setApiResult(null);
+                              }
+                            } else {
+                              throw new Error(data.message || 'Failed to extract nutrition');
+                            }
+                          } catch (err) {
+                            setCameraError('Failed to analyze nutrition label. Please try again with better lighting and focus.');
+                          } finally {
+                            setIsScanning(false);
+                            setProcessingStatus(null);
+                          }
+                        }}
+                        disabled={isScanning}
+                      >
+                        {isScanning ? (
+                          <>
+                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                            Analyzing...
+                          </>
+                        ) : (
+                          <>
+                            <Scan className="h-4 w-4 mr-2" />
+                            Analyze
+                          </>
+                        )}
+                      </Button>
+                    </div>
+                  )}
                 </TabsContent>
 
                 <TabsContent value="camera" className="mt-6">
-                  <div className="space-y-4">
-                    {isModelLoading ? (
-                      <Alert>
-                        <AlertTriangle className="h-4 w-4" />
-                        <AlertDescription>Loading image analysis model...</AlertDescription>
-                      </Alert>
-                    ) : cameraError ? (
-                      <Alert>
+                  <div className="flex flex-col items-center">
+                    <Webcam
+                      ref={webcamRef}
+                      audio={false}
+                      screenshotFormat="image/jpeg"
+                      className="w-full max-w-md object-cover rounded-lg border border-gray-200"
+                      videoConstraints={videoConstraints}
+                      onUserMediaError={() => setCameraError('Unable to access camera. Please check permissions.')}
+                    />
+                    <Button
+                      className="mt-4 bg-blue-600 hover:bg-blue-700"
+                      onClick={handleCapture}
+                      disabled={isScanning}
+                    >
+                      Capture
+                    </Button>
+                    {capturedImage && (
+                      <div className="mt-4 flex flex-col items-center">
+                        <img
+                          src={capturedImage}
+                          alt="Captured nutrition label"
+                          className="object-contain w-full h-auto max-h-80 border rounded"
+                          style={{ maxWidth: '100%', height: 'auto' }}
+                        />
+                        <Button
+                          className="mt-4 bg-emerald-600 hover:bg-emerald-700"
+                          onClick={() => runOcrAndParse(capturedImage)}
+                          disabled={isScanning}
+                        >
+                          {isScanning ? (
+                            <>
+                              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                              Analyzing...
+                            </>
+                          ) : (
+                            <>
+                              <Scan className="h-4 w-4 mr-2" />
+                              Analyze
+                            </>
+                          )}
+                        </Button>
+                      </div>
+                    )}
+                    {cameraError && (
+                      <Alert className="mt-4">
                         <AlertTriangle className="h-4 w-4" />
                         <AlertDescription>{cameraError}</AlertDescription>
-                        <Button 
-                          onClick={() => window.location.reload()} 
-                          className="mt-4"
-                          variant="outline"
-                        >
-                          <RotateCcw className="h-4 w-4 mr-2" />
-                          Retry Camera Access
-                        </Button>
                       </Alert>
-                    ) : !hasPermission ? (
-                      <Alert>
-                        <AlertTriangle className="h-4 w-4" />
-                        <AlertDescription>Waiting for camera permission...</AlertDescription>
-                      </Alert>
-                    ) : (
-                      <div className="relative aspect-video w-full max-w-2xl mx-auto rounded-lg overflow-hidden bg-gray-100">
-                        <Webcam
-                          ref={webcamRef}
-                          audio={false}
-                          screenshotFormat="image/jpeg"
-                          videoConstraints={videoConstraints}
-                          className="w-full h-full object-cover"
-                          onUserMedia={() => setIsModelLoading(false)}
-                          onUserMediaError={(err) => {
-                            console.error('Camera error:', err);
-                            setCameraError('Failed to access camera. Please check permissions and try again.');
-                          }}
+                    )}
+                  </div>
+                </TabsContent>
+
+                <TabsContent value="esp32" className="mt-6">
+                  <div className="flex flex-col items-center">
+                    <img
+                      src={`http://localhost:5000/latest_esp32_image?t=${Date.now()}`}
+                      alt="ESP32 Live Feed"
+                      className="w-full max-w-md object-contain rounded-lg border border-gray-200"
+                      style={{ maxHeight: '60vh', width: 'auto', maxWidth: '100%' }}
+                    />
+                    <Button
+                      className="mt-4 bg-blue-600 hover:bg-blue-700"
+                      onClick={async () => {
+                        // Fetch the current image from ESP32
+                        const response = await fetch('http://localhost:5000/latest_esp32_image');
+                        if (!response.ok) {
+                          setCameraError('Failed to fetch ESP32 image.');
+                          return;
+                        }
+                        const blob = await response.blob();
+                        const reader = new FileReader();
+                        reader.onloadend = () => {
+                          setEsp32Image(reader.result as string);
+                        };
+                        reader.readAsDataURL(blob);
+                      }}
+                      disabled={isScanning}
+                    >
+                      Capture
+                    </Button>
+                    {esp32Image && (
+                      <div className="mt-4 flex flex-col items-center">
+                        <img
+                          src={esp32Image}
+                          alt="ESP32 nutrition label"
+                          className="object-contain w-full h-auto max-h-80 border rounded"
+                          style={{ maxWidth: '100%', height: 'auto' }}
                         />
-                        {isModelLoading && (
-                          <div className="absolute inset-0 flex items-center justify-center bg-gray-900/50">
-                            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white"></div>
-                          </div>
-                        )}
-                        {cameraError && (
-                          <div className="absolute inset-0 flex items-center justify-center bg-gray-900/50">
-                            <div className="bg-white p-4 rounded-lg shadow-lg max-w-sm mx-4">
-                              <p className="text-red-600 mb-2">{cameraError}</p>
-                              <Button
-                                variant="outline"
-                                onClick={() => setCameraError(null)}
-                                className="w-full"
-                              >
-                                Try Again
-                              </Button>
-                            </div>
-                          </div>
-                        )}
-                        {!isModelLoading && !cameraError && (
-                          <div className="absolute inset-0 flex items-center justify-center">
-                            <div className="border-2 border-white/50 rounded-lg p-4">
-                              <p className="text-white text-center mb-2">Position the label within the frame</p>
-                              <Button
-                                onClick={handleCapture}
-                                disabled={isScanning}
-                                className="bg-emerald-600 hover:bg-emerald-700 text-white"
-                              >
-                                {isScanning ? (
-                                  <>
-                                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                                    {processingStatus || 'Processing...'}
-                                  </>
-                                ) : (
-                                  <>
-                                    <Camera className="h-4 w-4 mr-2" />
-                                    Capture
-                                  </>
-                                )}
-                              </Button>
-                            </div>
-                          </div>
-                        )}
+                        <Button
+                          className="mt-4 bg-emerald-600 hover:bg-emerald-700"
+                          onClick={() => runOcrAndParse(esp32Image)}
+                          disabled={isScanning}
+                        >
+                          {isScanning ? (
+                            <>
+                              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                              Analyzing...
+                            </>
+                          ) : (
+                            <>
+                              <Scan className="h-4 w-4 mr-2" />
+                              Analyze
+                            </>
+                          )}
+                        </Button>
                       </div>
+                    )}
+                    {cameraError && (
+                      <Alert className="mt-4">
+                        <AlertTriangle className="h-4 w-4" />
+                        <AlertDescription>{cameraError}</AlertDescription>
+                      </Alert>
                     )}
                   </div>
                 </TabsContent>
@@ -527,6 +645,206 @@ export default function ScanLabel() {
       {/* Scan Results */}
       {scanResult && (
         <div className="space-y-8 opacity-100">
+          {/* Captured Image Display */}
+          {capturedImage && (
+            <div className="mb-4 flex flex-col items-center">
+              <h4 className="font-medium text-gray-900 mb-2">Captured Image (Laptop Camera)</h4>
+              <div className="relative rounded-lg overflow-hidden border border-gray-200 max-w-xs w-full flex justify-center">
+                <img
+                  src={capturedImage}
+                  alt="Captured nutrition label"
+                  className="object-contain w-full h-auto max-h-80"
+                  style={{ maxWidth: '100%', height: 'auto' }}
+                />
+              </div>
+              <Button
+                className="mt-4 bg-emerald-600 hover:bg-emerald-700"
+                onClick={async () => {
+                  setIsScanning(true);
+                  setCameraError(null);
+                  setApiResult(null);
+                  setOllamaResult(null);
+                  setBackendResponse(null);
+                  try {
+                    // Assume imageSrc is the image to analyze (captured/uploaded/esp32)
+                    // Run OCR to get text
+                    const result = await Tesseract.recognize(capturedImage, 'eng', { logger: m => console.log(m) });
+                    const text = result.data.text;
+                    setOcrText(text);
+                    setProcessingStatus('Analyzing nutrition information...');
+                    // Send to backend for nutrition extraction (API first, fallback to Ollama)
+                    const response = await fetch('http://localhost:5000/extract_nutrition', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ text }),
+                    });
+                    const data = await response.json();
+                    setBackendResponse(data);
+                    if (data.status === 'success') {
+                      if (data.source === 'api' && data.nutrition) {
+                        setApiResult(data.nutrition);
+                        setScanResult(data.nutrition);
+                      } else if (data.source === 'ollama' && data.ollama_result) {
+                        setOllamaResult(data.ollama_result);
+                        setScanResult(data.ollama_result);
+                      } else if (data.raw_response) {
+                        setOllamaResult(null);
+                        setApiResult(null);
+                      }
+                    } else {
+                      throw new Error(data.message || 'Failed to extract nutrition');
+                    }
+                  } catch (err) {
+                    setCameraError('Failed to analyze nutrition label. Please try again with better lighting and focus.');
+                  } finally {
+                    setIsScanning(false);
+                    setProcessingStatus(null);
+                  }
+                }}
+                disabled={isScanning}
+              >
+                {isScanning ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Analyzing...
+                  </>
+                ) : (
+                  <>
+                    <Scan className="h-4 w-4 mr-2" />
+                    Analyze
+                  </>
+                )}
+              </Button>
+            </div>
+          )}
+          {esp32Image && (
+            <div className="mb-4 flex flex-col items-center">
+              <h4 className="font-medium text-gray-900 mb-2">ESP32 Captured Image</h4>
+              <div className="relative rounded-lg overflow-hidden border border-gray-200 max-w-xs w-full flex justify-center">
+                <img
+                  src={esp32Image}
+                  alt="ESP32 nutrition label"
+                  className="object-contain w-full h-auto max-h-80"
+                  style={{ maxWidth: '100%', height: 'auto' }}
+                />
+              </div>
+              <Button
+                className="mt-4 bg-emerald-600 hover:bg-emerald-700"
+                onClick={async () => {
+                  setIsScanning(true);
+                  setCameraError(null);
+                  setApiResult(null);
+                  setOllamaResult(null);
+                  setBackendResponse(null);
+                  try {
+                    // Assume imageSrc is the image to analyze (captured/uploaded/esp32)
+                    // Run OCR to get text
+                    const result = await Tesseract.recognize(esp32Image, 'eng', { logger: m => console.log(m) });
+                    const text = result.data.text;
+                    setOcrText(text);
+                    setProcessingStatus('Analyzing nutrition information...');
+                    // Send to backend for nutrition extraction (API first, fallback to Ollama)
+                    const response = await fetch('http://localhost:5000/extract_nutrition', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ text }),
+                    });
+                    const data = await response.json();
+                    setBackendResponse(data);
+                    if (data.status === 'success') {
+                      if (data.source === 'api' && data.nutrition) {
+                        setApiResult(data.nutrition);
+                        setScanResult(data.nutrition);
+                      } else if (data.source === 'ollama' && data.ollama_result) {
+                        setOllamaResult(data.ollama_result);
+                        setScanResult(data.ollama_result);
+                      } else if (data.raw_response) {
+                        setOllamaResult(null);
+                        setApiResult(null);
+                      }
+                    } else {
+                      throw new Error(data.message || 'Failed to extract nutrition');
+                    }
+                  } catch (err) {
+                    setCameraError('Failed to analyze nutrition label. Please try again with better lighting and focus.');
+                  } finally {
+                    setIsScanning(false);
+                    setProcessingStatus(null);
+                  }
+                }}
+                disabled={isScanning}
+              >
+                {isScanning ? (
+                  <>
+                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                    Analyzing...
+                  </>
+                ) : (
+                  <>
+                    <Scan className="h-4 w-4 mr-2" />
+                    Analyze
+                  </>
+                )}
+              </Button>
+            </div>
+          )}
+          {/* OCR Text Debug */}
+          {ocrText && (
+            <div className="mb-4 p-2 bg-gray-100 rounded">
+              <h4 className="font-medium text-gray-900 mb-1">OCR Text</h4>
+              <pre className="text-xs text-gray-700 whitespace-pre-wrap">{ocrText}</pre>
+            </div>
+          )}
+          {/* Ollama Result */}
+          {!apiResult && ollamaResult && (
+            <div className="space-y-4">
+              <div className="text-center">
+                <div className="text-lg text-emerald-700 font-bold">
+                  Nutrition Analysis (Ollama)
+                </div>
+                <div className="text-sm text-gray-600">Calories: {ollamaResult.calories ?? 'N/A'}</div>
+                <div className="text-sm text-gray-600">Protein: {ollamaResult.protein ?? 'N/A'}g</div>
+                <div className="text-sm text-gray-600">Carbs: {ollamaResult.carbs ?? 'N/A'}g</div>
+                <div className="text-sm text-gray-600">Fat: {ollamaResult.fat ?? 'N/A'}g</div>
+                <div className="text-sm text-gray-600">Fiber: {ollamaResult.fiber ?? 'N/A'}g</div>
+                <div className="text-sm text-gray-600">Sugar: {ollamaResult.sugar ?? 'N/A'}g</div>
+                <div className="text-sm text-gray-600">Sodium: {ollamaResult.sodium ?? 'N/A'}mg</div>
+                <div className="text-sm text-gray-600">Serving Size: {ollamaResult.serving_size ?? 'N/A'}</div>
+                {ollamaResult.ingredients && (
+                  <div className="text-sm text-gray-600 mt-2">
+                    <b>Ingredients:</b> {Array.isArray(ollamaResult.ingredients) ? ollamaResult.ingredients.join(', ') : ollamaResult.ingredients}
+                  </div>
+                )}
+                {typeof ollamaResult.health_score === 'number' ? (
+                  <div className="text-sm text-gray-600 mt-2">
+                    <b>Health Score:</b> {ollamaResult.health_score}
+                  </div>
+                ) : (
+                  <div className="text-sm text-gray-400 mt-2">
+                    <b>Health Score:</b> N/A
+                  </div>
+                )}
+                {ollamaResult.warnings && ollamaResult.warnings.length > 0 && (
+                  <div className="text-sm text-red-600 mt-2">
+                    <b>Warnings:</b> {Array.isArray(ollamaResult.warnings) ? ollamaResult.warnings.join(', ') : ollamaResult.warnings}
+                  </div>
+                )}
+                {ollamaResult.benefits && ollamaResult.benefits.length > 0 && (
+                  <div className="text-sm text-green-600 mt-2">
+                    <b>Benefits:</b> {Array.isArray(ollamaResult.benefits) ? ollamaResult.benefits.join(', ') : ollamaResult.benefits}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          {/* If backend returns a raw_response, show it for debugging: */}
+          {!apiResult && !ollamaResult && backendResponse && backendResponse.raw_response && (
+            <div className="bg-yellow-100 text-yellow-800 p-2 mt-4 rounded">
+              <b>Raw Response:</b>
+              <pre className="text-xs whitespace-pre-wrap">{backendResponse.raw_response}</pre>
+              <div className="text-xs text-red-600">Warning: No valid prediction available. Please check the prompt or try again.</div>
+            </div>
+          )}
           {/* Health Score Overview */}
           <Card className="bg-white/80 backdrop-blur-sm">
             <CardContent className="p-8">
@@ -625,12 +943,12 @@ export default function ScanLabel() {
                     <PieChart>
                       <Pie
                         data={[
-                          { name: 'Protein', value: scanResult.protein || 0 },
-                          { name: 'Carbs', value: scanResult.carbs || 0 },
-                          { name: 'Fat', value: scanResult.fat || 0 },
-                          { name: 'Fiber', value: scanResult.fiber || 0 },
-                          { name: 'Sugar', value: scanResult.sugar || 0 },
-                          { name: 'Sodium', value: (scanResult.sodium || 0) / 1000 }
+                          { name: 'Protein', value: Number(scanResult.protein) || 0 },
+                          { name: 'Carbs', value: Number(scanResult.carbs) || 0 },
+                          { name: 'Fat', value: Number(scanResult.fat) || 0 },
+                          { name: 'Fiber', value: Number(scanResult.fiber) || 0 },
+                          { name: 'Sugar', value: Number(scanResult.sugar) || 0 },
+                          { name: 'Sodium', value: Number(scanResult.sodium) ? Number(scanResult.sodium) / 1000 : 0 }
                         ]}
                         cx="50%"
                         cy="50%"
@@ -638,7 +956,7 @@ export default function ScanLabel() {
                         outerRadius={120}
                         fill="#8884d8"
                         dataKey="value"
-                        label={({ name, percent }) => `${name}: ${(percent * 100).toFixed(0)}%`}
+                        label={renderCustomizedLabel}
                       >
                         {Object.entries(NUTRITION_COLORS).map(([key, color]) => (
                           <Cell key={key} fill={color} />

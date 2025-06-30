@@ -6,7 +6,7 @@ import numpy as np
 import json
 from PIL import Image
 import io
-from nutrition_extraction import extract_nutrition
+from nutrition_extraction import extract_full_nutrition
 from dotenv import load_dotenv
 import requests
 from flask_cors import CORS
@@ -18,11 +18,15 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
+from datetime import datetime
+from apscheduler.schedulers.background import BackgroundScheduler
+from collections import defaultdict
+import logging
 
 # Load environment variables from .env
 load_dotenv()
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + GEMINI_API_KEY if GEMINI_API_KEY else None
+SERVER_API_KEY = os.getenv('SERVER_API_KEY')
+SERVER_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + SERVER_API_KEY if SERVER_API_KEY else None
 SMTP_SERVER = os.getenv('SMTP_SERVER')
 SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
 SMTP_USERNAME = os.getenv('SMTP_USERNAME')
@@ -34,6 +38,16 @@ CORS(app)  # Enable CORS for all routes
 
 # Initialize serial reader as a global singleton
 serial_reader = None
+
+LATEST_IOT_DATA = {
+    'temperature': 0.0,
+    'humidity': 0.0,
+    'lastUpdate': 'Never',
+    'connected': False
+}
+
+DAILY_NUTRITION_LOG = []  # List of dicts: {email, nutrition, timestamp}
+DAILY_IOT_LOG = []        # List of dicts: {email, iot_data, timestamp}
 
 def get_serial_reader():
     return SerialReader()
@@ -106,8 +120,8 @@ def predict_image_from_bytes(image_bytes):
         print(f"Error during image prediction: {e}")
         return "Prediction Error", 0.0, "error"
 
-def predict_with_gemini(image_bytes):
-    if not GEMINI_API_KEY or not GEMINI_API_URL:
+def predict_with_server(image_bytes):
+    if not SERVER_API_KEY or not SERVER_API_URL:
         return None
     try:
         img_b64 = base64.b64encode(image_bytes).decode('utf-8')
@@ -121,22 +135,22 @@ def predict_with_gemini(image_bytes):
                 }
             ]
         }
-        response = requests.post(GEMINI_API_URL, json=payload)
+        response = requests.post(SERVER_API_URL, json=payload)
         if response.status_code == 200:
             try:
-                # Try to extract the JSON from the Gemini response
+                # Try to extract the JSON from the server response
                 import re, json as pyjson
                 text = response.json()['candidates'][0]['content']['parts'][0]['text']
                 match = re.search(r'\{.*\}', text, re.DOTALL)
                 if match:
-                    gemini_result = pyjson.loads(match.group(0))
-                    return gemini_result
+                    server_result = pyjson.loads(match.group(0))
+                    return server_result
             except Exception as e:
-                print(f"Error parsing Gemini response: {e}")
+                print(f"Error parsing server response: {e}")
         else:
-            print(f"Gemini API error: {response.status_code} {response.text}")
+            print(f"Server API error: {response.status_code} {response.text}")
     except Exception as e:
-        print(f"Error calling Gemini API: {e}")
+        print(f"Error calling server API: {e}")
     return None
 
 @app.route('/')
@@ -146,38 +160,52 @@ def index():
 @app.route('/predict_from_esp32', methods=['POST'])
 def predict_from_esp32():
     if 'image' not in request.files:
-        return jsonify({"status": "error", "message": "No image file provided"}), 400
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({"status": "error", "message": "No selected file"}), 400
-    if file:
-        image_bytes = file.read()
-        # Save the latest image for frontend display
-        with open(LATEST_IMAGE_PATH, 'wb') as f:
-            f.write(image_bytes)
-        # Try Gemini API first
-        gemini_result = predict_with_gemini(image_bytes)
-        if gemini_result and 'predictedClass' in gemini_result and 'confidence' in gemini_result:
-            response_data = {
+        return jsonify({'status': 'error', 'message': 'No image uploaded'}), 400
+    image_file = request.files['image']
+    image_bytes = image_file.read()
+    # Try API first
+    try:
+        api_result = predict_with_server(image_bytes)
+        if api_result and 'predictedClass' in api_result and 'confidence' in api_result:
+            logging.info(f"API spoilage response: {api_result}")
+            return jsonify({
                 "status": "success",
-                "foodItemName": gemini_result.get('foodItemName', 'Unknown'),
-                "predictedClass": gemini_result['predictedClass'],
-                "confidence": float(gemini_result['confidence']) * 100,
-                "source": "gemini"
-            }
-            return jsonify(response_data)
-        # Fallback to local model
-        raw_prediction, confidence, spoilage_status = predict_image_from_bytes(image_bytes)
-        response_data = {
-            "status": "success",
-            "predictedClass": raw_prediction,
-            "confidence": float(confidence) * 100,
-            "spoilage_status": spoilage_status,
-            "source": "local"
-        }
-        return jsonify(response_data)
-    else:
-        return jsonify({"status": "error", "message": "Invalid image format"}), 400
+                "api_result": api_result,
+                "source": "api"
+            })
+    except Exception as e:
+        logging.error(f"API spoilage error: {e}")
+    # Fallback to Ollama
+    image_b64 = base64.b64encode(image_bytes).decode('utf-8')
+    prompt = f"""
+You are a food spoilage detection expert. Given the following image (base64-encoded JPEG), analyze the food item and return a JSON object with keys: predictedClass, confidence (0-100), spoilage_status (fresh/good/warning/spoiled), foodItemName, and a short explanation. All values must be valid JSON types.
+
+Image (base64):
+{image_b64}
+"""
+    try:
+        ollama_response = call_ollama(prompt)
+        logging.info(f"Ollama spoilage response: {ollama_response}")
+        try:
+            result = json.loads(ollama_response)
+            return jsonify({
+                "status": "success",
+                "ollama_result": result,
+                "source": "ollama",
+                "api_result": None
+            })
+        except Exception as e:
+            logging.error(f"Failed to parse Ollama spoilage JSON: {e}")
+            return jsonify({
+                "status": "success",
+                "ollama_result": None,
+                "raw_response": ollama_response,
+                "source": "ollama",
+                "api_result": None
+            })
+    except Exception as e:
+        logging.error(f"Ollama spoilage error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/latest_esp32_image')
 def latest_esp32_image():
@@ -195,15 +223,15 @@ def get_latest_prediction_result():
         with open(LATEST_IMAGE_PATH, 'rb') as f:
             image_bytes = f.read()
 
-        # Try Gemini API first
-        gemini_result = predict_with_gemini(image_bytes)
-        if gemini_result and 'predictedClass' in gemini_result and 'confidence' in gemini_result:
+        # Try server API first
+        server_result = predict_with_server(image_bytes)
+        if server_result and 'predictedClass' in server_result and 'confidence' in server_result:
             response_data = {
                 "status": "success",
-                "foodItemName": gemini_result.get('foodItemName', 'Unknown'),
-                "predictedClass": gemini_result['predictedClass'],
-                "confidence": float(gemini_result['confidence']) * 100,
-                "source": "gemini"
+                "foodItemName": server_result.get('foodItemName', 'Unknown'),
+                "predictedClass": server_result['predictedClass'],
+                "confidence": float(server_result['confidence']) * 100,
+                "source": "server"
             }
             return jsonify(response_data)
 
@@ -222,8 +250,8 @@ def get_latest_prediction_result():
         print(f"Error processing latest image for prediction: {e}")
         return jsonify({"status": "error", "message": f"Failed to get latest prediction: {str(e)}"}), 500
 
-def analyze_nutrition_with_gemini(text):
-    if not GEMINI_API_KEY or not GEMINI_API_URL:
+def analyze_nutrition_with_server(text):
+    if not SERVER_API_KEY or not SERVER_API_URL:
         return None
     try:
         prompt = """Analyze this nutrition label text and extract ALL nutrition values present in the label. Return the data in this JSON format:
@@ -268,7 +296,7 @@ def analyze_nutrition_with_gemini(text):
                 }
             ]
         }
-        response = requests.post(GEMINI_API_URL, json=payload)
+        response = requests.post(SERVER_API_URL, json=payload)
         if response.status_code == 200:
             try:
                 text = response.json()['candidates'][0]['content']['parts'][0]['text']
@@ -277,53 +305,68 @@ def analyze_nutrition_with_gemini(text):
                 if match:
                     return pyjson.loads(match.group(0))
             except Exception as e:
-                print(f"Error parsing Gemini nutrition response: {e}")
+                print(f"Error parsing server nutrition response: {e}")
         else:
-            print(f"Gemini API error: {response.status_code} {response.text}")
+            print(f"Server API error: {response.status_code} {response.text}")
+            # Fallback to local extraction on any error
+            return None
     except Exception as e:
-        print(f"Error calling Gemini API for nutrition: {e}")
+        print(f"Error calling server API for nutrition: {e}")
     return None
 
 @app.route('/extract_nutrition', methods=['POST'])
-def extract_nutrition_api():
+def extract_nutrition():
     data = request.get_json()
-    if not data or 'text' not in data:
-        return jsonify({'status': 'error', 'message': 'No text provided'}), 400
-    
-    text = data['text']
-    
-    # Try Gemini API first
-    gemini_result = analyze_nutrition_with_gemini(text)
-    if gemini_result:
-        return jsonify({
-            'status': 'success',
-            'nutrition': gemini_result,
-            'source': 'gemini'
-        })
-    
-    # Fallback to local extraction
-    nutrition = extract_nutrition(text)
-    return jsonify({
-        'status': 'success',
-        'nutrition': nutrition,
-        'source': 'local'
-    })
+    text = data.get('text', '')
+    # Prompt for API
+    try:
+        api_result = analyze_nutrition_with_server(text)
+        if api_result:
+            logging.info(f"API nutrition response: {api_result}")
+            return jsonify({
+                "status": "success",
+                "nutrition": api_result,
+                "source": "api"
+            })
+    except Exception as e:
+        logging.error(f"API nutrition error: {e}")
+    # Fallback to Ollama
+    prompt = f"""
+Extract the nutrition facts from the following label text. Return the result as a JSON object with keys: calories, protein, carbs, fat, fiber, sugar, sodium, serving_size, ingredients (as a list), health_score (as a number between 0 and 10), warnings (as a list), benefits (as a list). All values must be valid JSON types. health_score must be a number.
+
+Label text:
+{text}
+"""
+    try:
+        ollama_response = call_ollama(prompt)
+        logging.info(f"Ollama nutrition response: {ollama_response}")
+        try:
+            nutrition = json.loads(ollama_response)
+            return jsonify({
+                "status": "success",
+                "nutrition": nutrition,
+                "source": "ollama",
+                "api_result": None,
+                "ollama_result": nutrition
+            })
+        except Exception as e:
+            logging.error(f"Failed to parse Ollama nutrition JSON: {e}")
+            return jsonify({
+                "status": "success",
+                "nutrition": None,
+                "raw_response": ollama_response,
+                "source": "ollama",
+                "api_result": None,
+                "ollama_result": None
+            })
+    except Exception as e:
+        logging.error(f"Ollama nutrition error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/get_iot_data')
 def get_iot_data():
     try:
-        reader = get_serial_reader()
-        print("SerialReader instance id (in route):", id(reader))
-        data = reader.get_latest_data()
-        print("Data returned to frontend:", data)
-        # Ensure all values are properly formatted
-        response_data = {
-            'temperature': float(data.get('temperature', 0)),
-            'humidity': float(data.get('humidity', 0)),
-            'lastUpdate': str(data.get('lastUpdate', 'Never')),
-            'connected': bool(data.get('connected', False))
-        }
-        return jsonify(response_data)
+        return jsonify(LATEST_IOT_DATA)
     except Exception as e:
         return jsonify({
             'temperature': 0.0,
@@ -419,6 +462,142 @@ def send_email():
     except Exception as e:
         print(f"Error sending email: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/iot_data', methods=['POST'])
+def iot_data():
+    global LATEST_IOT_DATA
+    data = request.get_json()
+    print("Received IoT data:", data)
+    LATEST_IOT_DATA = {
+        'temperature': float(data.get('temperature', 0)),
+        'humidity': float(data.get('humidity', 0)),
+        'lastUpdate': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'connected': True
+    }
+    recipient_email = data.get('email')
+    if recipient_email:
+        DAILY_IOT_LOG.append({
+            'email': recipient_email,
+            'iot_data': LATEST_IOT_DATA.copy(),
+            'timestamp': datetime.now().isoformat()
+        })
+    return jsonify({"status": "success"})
+
+def send_custom_email(subject, html_content, recipient_email):
+    msg = MIMEMultipart()
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = recipient_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(html_content, 'html'))
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(msg)
+
+# --- Scheduled Jobs: Send daily reports to each user ---
+def send_daily_nutrition_report():
+    user_logs = defaultdict(list)
+    for entry in DAILY_NUTRITION_LOG:
+        user_logs[entry['email']].append(entry)
+    for email, entries in user_logs.items():
+        html_content = f"<h2>Your Daily Nutrition Report</h2><ul>"
+        for e in entries:
+            html_content += f"<li>{e['nutrition']}</li>"
+        html_content += "</ul>"
+        send_custom_email("Daily Nutrition Analysis Report", html_content, email)
+    DAILY_NUTRITION_LOG.clear()
+
+def send_iot_report(time_of_day):
+    user_logs = defaultdict(list)
+    for entry in DAILY_IOT_LOG:
+        user_logs[entry['email']].append(entry)
+    for email, entries in user_logs.items():
+        latest = entries[-1]['iot_data'] if entries else {}
+        html_content = f"<h2>IoT Report ({time_of_day})</h2>"
+        html_content += f"<p>Temperature: {latest.get('temperature', 'N/A')}°C<br>Humidity: {latest.get('humidity', 'N/A')}%</p>"
+        send_custom_email(f"IoT Report ({time_of_day})", html_content, email)
+    # Optionally clear log after evening report
+    if time_of_day == 'Evening':
+        DAILY_IOT_LOG.clear()
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(send_daily_nutrition_report, 'cron', hour=20, minute=0)  # 8 PM
+scheduler.add_job(lambda: send_iot_report('Morning'), 'cron', hour=8, minute=0)  # 8 AM
+scheduler.add_job(lambda: send_iot_report('Evening'), 'cron', hour=20, minute=0)  # 8 PM
+scheduler.start()
+
+# --- Ollama Integration: Text-based prediction using local model (mistral) ---
+@app.route('/predict_with_ollama', methods=['POST'])
+def predict_with_ollama():
+    data = request.get_json()
+    prompt = data.get('prompt')
+    model = data.get('model', 'mistral')
+    if not prompt:
+        return jsonify({'status': 'error', 'message': 'No prompt provided'}), 400
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False
+            }
+        )
+        if response.status_code == 200:
+            result = response.json()
+            return jsonify({'status': 'success', 'response': result.get('response', '')})
+        else:
+            return jsonify({'status': 'error', 'message': f'Ollama API error: {response.status_code} {response.text}'}), 500
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': f'Error calling Ollama: {e}'}), 500
+
+# --- NodeMCU DHT Sensor Endpoint ---
+LATEST_NODEMCU_DHT = {
+    'temperature': 0.0,
+    'humidity': 0.0,
+    'lastUpdate': 'Never',
+    'email': None
+}
+
+@app.route('/nodemcu_dht', methods=['POST'])
+def nodemcu_dht():
+    global LATEST_NODEMCU_DHT
+    data = request.get_json()
+    print("Received NodeMCU DHT data:", data)
+    LATEST_NODEMCU_DHT = {
+        'temperature': float(data.get('temperature', 0)),
+        'humidity': float(data.get('humidity', 0)),
+        'lastUpdate': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'email': data.get('email')
+    }
+    # Log for daily report if email provided
+    recipient_email = data.get('email')
+    if recipient_email:
+        DAILY_IOT_LOG.append({
+            'email': recipient_email,
+            'iot_data': LATEST_NODEMCU_DHT.copy(),
+            'timestamp': datetime.now().isoformat()
+        })
+    return jsonify({"status": "success"})
+
+@app.route('/get_latest_nodemcu_dht', methods=['GET'])
+def get_latest_nodemcu_dht():
+    return jsonify(LATEST_NODEMCU_DHT)
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "mistral"
+
+# Helper to call Ollama with a prompt
+
+def call_ollama(prompt):
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False
+    }
+    response = requests.post(OLLAMA_URL, json=payload)
+    response.raise_for_status()
+    return response.json()["response"]
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False) 
